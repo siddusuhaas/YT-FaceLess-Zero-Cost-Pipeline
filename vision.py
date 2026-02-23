@@ -32,7 +32,6 @@ import io
 # ── Configuration ─────────────────────────────────────────────────────────────
 DRAW_THINGS_URL = "http://localhost:7888"
 TXT2IMG_ENDPOINT = f"{DRAW_THINGS_URL}/sdapi/v1/txt2img"
-API_TIMEOUT = 300  # 5 minutes per image (generous for complex prompts)
 
 # Output canvas: 1080×1920 (9:16 vertical for YouTube Shorts)
 # Draw Things generates square images; we'll crop/pad in assembly.py
@@ -43,22 +42,20 @@ IMAGE_HEIGHT = 1344   # ~9:16 ratio at 768 width
 OUTPUT_DIR = Path("output")
 
 # ── Default Generation Parameters ─────────────────────────────────────────────
+# ── Default Generation Parameters Optimized for FLUX.1 [schnell] ─────────────
+# Updated for M4 Air Heat Management
 DEFAULT_PARAMS = {
-    "width": IMAGE_WIDTH,
-    "height": IMAGE_HEIGHT,
-    "steps": 25,                    # Good quality/speed balance
-    "cfg_scale": 7.5,               # Prompt adherence
-    "sampler_name": "DPM++ 2M Karras",
-    "negative_prompt": (
-        "ugly, blurry, low quality, distorted, deformed, modern clothing, "
-        "western art style, cartoon, anime, text, watermark, signature, "
-        "nsfw, violence, gore, modern buildings, cars, technology"
-    ),
-    "restore_faces": False,
-    "tiling": False,
+    "width": 576,                    # Reduced resolution (huge speed gain)
+    "height": 1024,                  # Keeps the 9:16 vertical ratio
+    "steps": 4,                      # Absolute minimum steps for Flux
+    "cfg_scale": 1.0,
+    "sampler_name": "Euler A Trailing",
+    "shift": 3.17,
     "n_iter": 1,
     "batch_size": 1,
 }
+# Also, change the timeout to give your Mac more room
+API_TIMEOUT = 600 # Increases to 10 minutes
 
 
 # ── API Health Check ──────────────────────────────────────────────────────────
@@ -66,32 +63,19 @@ DEFAULT_PARAMS = {
 def check_draw_things_running(verbose: bool = True) -> bool:
     """
     Check if Draw Things HTTP API is accessible.
-
-    Returns:
-        True if API is reachable, False otherwise
     """
     try:
-        response = requests.get(f"{DRAW_THINGS_URL}/sdapi/v1/sd-models", timeout=5)
+        # We try the base URL since we know it returns a valid JSON response on your Mac
+        response = requests.get(DRAW_THINGS_URL, timeout=5)
         if response.status_code == 200:
             if verbose:
                 print(f"   ✅ Draw Things API is running at {DRAW_THINGS_URL}")
             return True
-        else:
-            if verbose:
-                print(f"   ⚠️  Draw Things API returned status {response.status_code}")
-            return False
-    except requests.exceptions.ConnectionError:
+        return False
+    except Exception:
         if verbose:
             print(f"   ❌ Cannot connect to Draw Things at {DRAW_THINGS_URL}")
-            print(f"   ℹ️  Please open Draw Things app and enable:")
-            print(f"       Settings → API Server → Enable HTTP API (port 7888)")
         return False
-    except Exception as e:
-        if verbose:
-            print(f"   ❌ Draw Things check failed: {e}")
-        return False
-
-
 # ── Single Image Generation ───────────────────────────────────────────────────
 
 def generate_single_image(

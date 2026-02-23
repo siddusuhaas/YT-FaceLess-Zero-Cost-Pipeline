@@ -28,6 +28,7 @@ from moviepy.editor import (
     AudioFileClip,
     CompositeVideoClip,
     ImageClip,
+    VideoClip,
     VideoFileClip,
     concatenate_videoclips,
 )
@@ -112,62 +113,60 @@ def _prepare_image(image_path: Path) -> np.ndarray:
     top = (new_h - target_h) // 2
     img = img.crop((left, top, left + target_w, top + target_h))
 
-    return np.array(img)
+    # Convert to numpy array
+    img_array = np.array(img)
+    # Ensure it's a 3D array (H, W, C)
+    if len(img_array.shape) == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    return img_array
 
 
 # ── Ken Burns Effect ──────────────────────────────────────────────────────────
 
-def _make_ken_burns_clip(
-    image_path: Path,
-    duration: float,
-    direction: int = 0,
-) -> ImageClip:
+class KenBurnsClip(VideoClip):
     """
-    Create a Ken Burns (slow zoom + pan) video clip from a single image.
-
-    Args:
-        image_path: Path to the source image
-        duration: Duration of the clip in seconds
-        direction: 0-3 for different zoom/pan directions (variety)
-
-    Returns:
-        MoviePy ImageClip with Ken Burns animation
+    Custom VideoClip that applies Ken Burns (slow zoom + pan) effect.
     """
-    img_array = _prepare_image(image_path)
-    src_h, src_w = img_array.shape[:2]
-
-    # Define start/end zoom and pan based on direction
-    directions = [
-        # (start_zoom, end_zoom, start_pan_x, end_pan_x, start_pan_y, end_pan_y)
-        (1.0, ZOOM_FACTOR, 0, PAN_RANGE_X, 0, PAN_RANGE_Y),          # zoom in, pan right-down
-        (ZOOM_FACTOR, 1.0, PAN_RANGE_X, 0, PAN_RANGE_Y, 0),          # zoom out, pan left-up
-        (1.0, ZOOM_FACTOR, PAN_RANGE_X, 0, 0, PAN_RANGE_Y),          # zoom in, pan left-down
-        (ZOOM_FACTOR, 1.0, 0, PAN_RANGE_X, PAN_RANGE_Y, 0),          # zoom out, pan right-up
-    ]
-    start_z, end_z, spx, epx, spy, epy = directions[direction % 4]
-
-    def make_frame(t: float) -> np.ndarray:
+    def __init__(self, img_array: np.ndarray, duration: float, direction: int = 0):
+        super().__init__()
+        self.img = img_array
+        self.duration = duration
+        self.fps = VIDEO_FPS
+        
+        # Get image dimensions
+        self.src_h, self.src_w = img_array.shape[:2]
+        
+        # Define start/end zoom and pan based on direction
+        directions = [
+            (1.0, ZOOM_FACTOR, 0, PAN_RANGE_X, 0, PAN_RANGE_Y),
+            (ZOOM_FACTOR, 1.0, PAN_RANGE_X, 0, PAN_RANGE_Y, 0),
+            (1.0, ZOOM_FACTOR, PAN_RANGE_X, 0, 0, PAN_RANGE_Y),
+            (ZOOM_FACTOR, 1.0, 0, PAN_RANGE_X, PAN_RANGE_Y, 0),
+        ]
+        self.start_z, self.end_z, self.spx, self.epx, self.spy, self.epy = directions[direction % 4]
+        
+    def make_frame(self, t: float) -> np.ndarray:
         """Generate a single frame at time t with Ken Burns transform."""
-        progress = t / duration  # 0.0 → 1.0
+        progress = t / self.duration
 
         # Interpolate zoom and pan
-        zoom = start_z + (end_z - start_z) * progress
-        pan_x = int(spx + (epx - spx) * progress)
-        pan_y = int(spy + (epy - spy) * progress)
+        zoom = self.start_z + (self.end_z - self.start_z) * progress
+        pan_x = int(self.spx + (self.epx - self.spx) * progress)
+        pan_y = int(self.spy + (self.epy - self.spy) * progress)
 
         # Calculate crop dimensions at current zoom level
         crop_w = int(VIDEO_WIDTH / zoom)
         crop_h = int(VIDEO_HEIGHT / zoom)
 
         # Center of the source image
-        center_x = src_w // 2 + pan_x
-        center_y = src_h // 2 + pan_y
+        center_x = self.src_w // 2 + pan_x
+        center_y = self.src_h // 2 + pan_y
 
         # Crop coordinates
         x1 = max(0, center_x - crop_w // 2)
         y1 = max(0, center_y - crop_h // 2)
-        x2 = min(src_w, x1 + crop_w)
-        y2 = min(src_h, y1 + crop_h)
+        x2 = min(self.src_w, x1 + crop_w)
+        y2 = min(self.src_h, y1 + crop_h)
 
         # Adjust if we hit boundaries
         if x2 - x1 < crop_w:
@@ -176,15 +175,23 @@ def _make_ken_burns_clip(
             y1 = max(0, y2 - crop_h)
 
         # Crop and resize to video dimensions
-        cropped = img_array[y1:y2, x1:x2]
+        cropped = self.img[y1:y2, x1:x2]
         frame_img = Image.fromarray(cropped).resize(
             (VIDEO_WIDTH, VIDEO_HEIGHT), Image.BILINEAR
         )
         return np.array(frame_img)
 
-    clip = ImageClip(make_frame=make_frame, duration=duration)
-    clip = clip.set_fps(VIDEO_FPS)
-    return clip
+
+def _make_ken_burns_clip(
+    image_path: Path,
+    duration: float,
+    direction: int = 0,
+) -> KenBurnsClip:
+    """
+    Create a Ken Burns (slow zoom + pan) video clip from a single image.
+    """
+    img_array = _prepare_image(image_path)
+    return KenBurnsClip(img_array, duration, direction)
 
 
 # ── Caption Frame Renderer ────────────────────────────────────────────────────
@@ -193,29 +200,19 @@ def _render_caption_frame(
     text: str,
     frame_size: tuple = (VIDEO_WIDTH, VIDEO_HEIGHT),
 ) -> np.ndarray:
-    """
-    Render a single caption frame as a transparent RGBA numpy array.
-    White text with thick black stroke on a semi-transparent dark background.
-
-    Returns:
-        RGBA numpy array of shape (VIDEO_HEIGHT, VIDEO_WIDTH, 4)
-    """
+    """Render a single caption frame as a transparent RGBA numpy array."""
     font = _get_font(CAPTION_FONT_SIZE)
 
-    # Create transparent canvas
     canvas = Image.new("RGBA", frame_size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
-    # Measure text dimensions
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
 
-    # Center horizontally, position at CAPTION_Y_POSITION vertically
     x = (frame_size[0] - text_w) // 2
     y = int(frame_size[1] * CAPTION_Y_POSITION) - text_h // 2
 
-    # Draw semi-transparent background pill
     bg_x1 = x - CAPTION_BG_PADDING
     bg_y1 = y - CAPTION_BG_PADDING
     bg_x2 = x + text_w + CAPTION_BG_PADDING
@@ -226,7 +223,6 @@ def _render_caption_frame(
         fill=(0, 0, 0, CAPTION_BG_ALPHA)
     )
 
-    # Draw black stroke (outline) by drawing text offset in 8 directions
     stroke_offsets = [
         (-CAPTION_STROKE_WIDTH, -CAPTION_STROKE_WIDTH),
         (0, -CAPTION_STROKE_WIDTH),
@@ -245,7 +241,6 @@ def _render_caption_frame(
             fill=(*CAPTION_STROKE_COLOR, 255)
         )
 
-    # Draw white text on top
     draw.text((x, y), text, font=font, fill=(*CAPTION_COLOR, 255))
 
     return np.array(canvas)
@@ -257,16 +252,7 @@ def _build_caption_clips(
     caption_chunks: list,
     total_duration: float,
 ) -> list:
-    """
-    Build a list of MoviePy ImageClips for each caption chunk.
-
-    Args:
-        caption_chunks: List of {"text": str, "start": float, "end": float}
-        total_duration: Total video duration in seconds
-
-    Returns:
-        List of positioned ImageClips with correct start/end times
-    """
+    """Build a list of MoviePy ImageClips for each caption chunk."""
     caption_clips = []
 
     for chunk in caption_chunks:
@@ -278,14 +264,10 @@ def _build_caption_clips(
         if duration <= 0 or not text:
             continue
 
-        # Render caption frame as RGBA
         frame_rgba = _render_caption_frame(text)
-
-        # Convert RGBA to RGB + mask
         frame_rgb = frame_rgba[:, :, :3]
         frame_alpha = frame_rgba[:, :, 3] / 255.0
 
-        # Create ImageClip from the caption frame
         caption_clip = (
             ImageClip(frame_rgb, ismask=False)
             .set_start(start)
@@ -293,7 +275,6 @@ def _build_caption_clips(
             .set_opacity(1.0)
         )
 
-        # Apply alpha mask
         mask_clip = ImageClip(frame_alpha, ismask=True).set_duration(duration)
         caption_clip = caption_clip.set_mask(mask_clip).set_start(start)
 
@@ -311,19 +292,7 @@ def assemble_video(
     output_path: Path = FINAL_VIDEO,
     verbose: bool = True,
 ) -> Optional[Path]:
-    """
-    Assemble the final YouTube Short video.
-
-    Args:
-        image_paths: List of Paths to generated images
-        audio_path: Path to narration MP3
-        caption_chunks: List of {"text", "start", "end"} dicts
-        output_path: Where to save the final MP4
-        verbose: Whether to print progress
-
-    Returns:
-        Path to final video, or None on failure
-    """
+    """Assemble the final YouTube Short video."""
     if verbose:
         print(f"\n🎬 [assembly.py] Assembling final video...")
         print(f"   Canvas: {VIDEO_WIDTH}×{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
@@ -332,7 +301,7 @@ def assemble_video(
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # ── Load Audio ────────────────────────────────────────────────────────────
+    # Load Audio
     if verbose:
         print(f"\n   📻 Loading audio: {audio_path}")
     try:
@@ -344,29 +313,26 @@ def assemble_video(
         print(f"   ❌ Failed to load audio: {e}")
         return None
 
-    # ── Distribute Images Across Timeline ─────────────────────────────────────
     if not image_paths:
         print("   ❌ No images provided for assembly.")
         return None
 
     num_images = len(image_paths)
-    # Distribute duration evenly, clamped to min/max
     base_duration = total_duration / num_images
     image_duration = max(MIN_IMAGE_DURATION, min(MAX_IMAGE_DURATION, base_duration))
 
     if verbose:
         print(f"\n   🖼️  Building {num_images} Ken Burns clips ({image_duration:.1f}s each)...")
 
-    # ── Build Ken Burns Clips ─────────────────────────────────────────────────
+    # Build Ken Burns Clips
     kb_clips = []
     current_time = 0.0
 
     for i, img_path in enumerate(image_paths):
-        # Last image fills remaining duration
         if i == num_images - 1:
             clip_duration = max(MIN_IMAGE_DURATION, total_duration - current_time + CROSSFADE_DURATION)
         else:
-            clip_duration = image_duration + CROSSFADE_DURATION  # overlap for crossfade
+            clip_duration = image_duration + CROSSFADE_DURATION
 
         if verbose:
             print(f"   [{i+1}/{num_images}] Ken Burns on {img_path.name} ({clip_duration:.1f}s)...")
@@ -375,10 +341,10 @@ def assemble_video(
             kb_clip = _make_ken_burns_clip(
                 image_path=img_path,
                 duration=clip_duration,
-                direction=i,  # Alternate directions for variety
+                direction=i,
             )
+            kb_clip = kb_clip.set_fps(VIDEO_FPS)
 
-            # Apply fade in/out for crossfade effect
             if i > 0:
                 kb_clip = fadein(kb_clip, CROSSFADE_DURATION)
             if i < num_images - 1:
@@ -389,7 +355,6 @@ def assemble_video(
 
         except Exception as e:
             print(f"   ⚠️  Ken Burns failed for image {i+1}: {e}")
-            # Fallback: static image clip
             try:
                 img_array = _prepare_image(img_path)
                 static_clip = (
@@ -401,20 +366,18 @@ def assemble_video(
             except Exception as e2:
                 print(f"   ❌ Static fallback also failed: {e2}")
 
-        current_time += image_duration  # Advance by base duration (not clip_duration)
+        current_time += image_duration
 
     if not kb_clips:
         print("   ❌ No video clips could be created.")
         return None
 
-    # ── Composite Background ──────────────────────────────────────────────────
     if verbose:
         print(f"\n   🎞️  Compositing background clips...")
 
     background = CompositeVideoClip(kb_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
     background = background.set_duration(total_duration)
 
-    # ── Build Caption Overlay ─────────────────────────────────────────────────
     if verbose:
         print(f"   💬 Building {len(caption_chunks)} caption overlays...")
 
@@ -423,13 +386,13 @@ def assemble_video(
     if verbose:
         print(f"   ✅ {len(caption_clips)} caption clips created")
 
-    # ── Final Composite ───────────────────────────────────────────────────────
+    # Final Composite
     all_clips = [background] + caption_clips
     final_video = CompositeVideoClip(all_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
     final_video = final_video.set_audio(audio_clip)
     final_video = final_video.set_duration(total_duration)
 
-    # ── Render to File ────────────────────────────────────────────────────────
+    # Render to File
     if verbose:
         print(f"\n   🔄 Rendering final video to {output_path}...")
         print(f"   ⏳ This may take 2-5 minutes depending on video length...")
@@ -443,12 +406,12 @@ def assemble_video(
             audio_codec="aac",
             audio_bitrate="192k",
             ffmpeg_params=[
-                "-crf", "18",          # High quality (lower = better, 18 is near-lossless)
-                "-preset", "medium",   # Encoding speed/quality balance
-                "-pix_fmt", "yuv420p", # Maximum compatibility
-                "-movflags", "+faststart",  # Web-optimized (metadata at start)
+                "-crf", "18",
+                "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
             ],
-            threads=4,                 # Use multiple CPU cores
+            threads=4,
             logger=None if not verbose else "bar",
         )
 
@@ -472,7 +435,6 @@ def assemble_video(
         return None
 
     finally:
-        # Clean up MoviePy resources
         try:
             audio_clip.close()
             final_video.close()
@@ -480,12 +442,9 @@ def assemble_video(
             pass
 
 
-# ── CLI Entry Point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Load existing output files for testing
     print("🎬 assembly.py — Testing with existing output files...")
 
-    # Check required files
     missing = []
     if not AUDIO_FILE.exists():
         missing.append(str(AUDIO_FILE))
@@ -498,10 +457,8 @@ if __name__ == "__main__":
 
     if missing:
         print(f"❌ Missing required files: {', '.join(missing)}")
-        print("   Run voice.py and vision.py first, or use main.py for the full pipeline.")
         sys.exit(1)
 
-    # Load timestamps
     with open(TIMESTAMPS_FILE, "r") as f:
         chunks = json.load(f)
 
