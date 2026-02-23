@@ -1,0 +1,29 @@
+# ============================================================
+# YouTube Shorts Automation Pipeline - Requirements
+# Python 3.10 | Apple M4 | macOS
+# ============================================================
+
+# --- LLM Orchestration ---
+ollama==0.4.7
+
+# --- Text-to-Speech ---
+edge-tts==6.1.12
+
+# --- Transcription / Word Timestamps (Apple Neural Engine optimized) ---
+mlx-whisper==0.4.1
+mlx==0.29.4
+
+# --- Image I/O ---
+Pillow==10.4.0
+
+# --- Video Assembly ---
+moviepy==1.0.3
+imageio==2.34.2
+imageio-ffmpeg==0.5.1
+
+# --- Utilities ---
+numpy==1.26.4
+requests==2.32.3
+aiohttp==3.10.5
+aiofiles==24.1.0
+tqdm==4.66.5
