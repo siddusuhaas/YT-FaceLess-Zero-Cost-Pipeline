@@ -45,8 +45,8 @@ OUTPUT_DIR = Path("output")
 # ── Default Generation Parameters Optimized for FLUX.1 [schnell] ─────────────
 # Updated for M4 Air Heat Management
 DEFAULT_PARAMS = {
-    "width": 576,                    # Reduced resolution (huge speed gain)
-    "height": 1024,                  # Keeps the 9:16 vertical ratio
+    "width": IMAGE_WIDTH,            # 768px (Higher quality)
+    "height": IMAGE_HEIGHT,          # 1344px (Sharper source for 1080p video)
     "steps": 4,                      # Absolute minimum steps for Flux
     "cfg_scale": 1.0,
     "sampler_name": "Euler A Trailing",
@@ -161,6 +161,7 @@ def generate_single_image(
 
 def generate_images(
     image_prompts: list,
+    output_dir: Path = OUTPUT_DIR,
     verbose: bool = True
 ) -> list[Path]:
     """
@@ -168,12 +169,13 @@ def generate_images(
 
     Args:
         image_prompts: List of prompt strings (5-6 items)
+        output_dir: Directory to save images in
         verbose: Whether to print progress
 
     Returns:
         List of Paths to generated images (may be shorter than input if some fail)
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if verbose:
         print(f"\n🖼️  [vision.py] Generating {len(image_prompts)} images via Draw Things...")
@@ -190,7 +192,7 @@ def generate_images(
     generated_paths = []
 
     for i, prompt in enumerate(image_prompts):
-        output_path = OUTPUT_DIR / f"image_{i}.png"
+        output_path = output_dir / f"image_{i}.png"
 
         if verbose:
             print(f"\n   [{i+1}/{len(image_prompts)}] Image {i+1}:")
@@ -215,13 +217,14 @@ def generate_images(
 
 # ── Placeholder Image Generator (for --no-images mode) ───────────────────────
 
-def generate_placeholder_images(count: int = 5, verbose: bool = True) -> list[Path]:
+def generate_placeholder_images(count: int = 5, output_dir: Path = OUTPUT_DIR, verbose: bool = True) -> list[Path]:
     """
     Generate simple gradient placeholder images for testing without Draw Things.
     Creates visually distinct colored gradient images at full resolution.
 
     Args:
         count: Number of placeholder images to create
+        output_dir: Directory to save images in
         verbose: Whether to print progress
 
     Returns:
@@ -229,7 +232,7 @@ def generate_placeholder_images(count: int = 5, verbose: bool = True) -> list[Pa
     """
     import numpy as np
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if verbose:
         print(f"\n🖼️  [vision.py] Generating {count} placeholder images (no Draw Things)...")
@@ -245,7 +248,7 @@ def generate_placeholder_images(count: int = 5, verbose: bool = True) -> list[Pa
 
     paths = []
     for i in range(count):
-        output_path = OUTPUT_DIR / f"image_{i}.png"
+        output_path = output_dir / f"image_{i}.png"
         color1, color2 = color_schemes[i % len(color_schemes)]
 
         # Create gradient image

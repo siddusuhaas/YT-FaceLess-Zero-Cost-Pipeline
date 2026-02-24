@@ -22,8 +22,11 @@ Flags:
 import argparse
 import json
 import os
+import re
+import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Add current directory to path so we can import the modules
@@ -38,7 +41,16 @@ import assembly
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
-SCRIPT_FILE = OUTPUT_DIR / "script.json"
+ASSETS_DIR = Path("assets/music")
+
+def get_project_dir(topic: str) -> Path:
+    """Create a sanitized directory name based on the topic."""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Remove non-alphanumeric characters (except spaces and hyphens)
+    safe_name = re.sub(r'[^\w\s-]', '', topic).strip()
+    # Replace spaces with underscores
+    safe_name = re.sub(r'[-\s]+', '_', safe_name)
+    return OUTPUT_DIR / f"{timestamp}_{safe_name}"
 
 
 # ── CLI Argument Parser ───────────────────────────────────────────────────────
@@ -85,41 +97,54 @@ Required external services:
         help="Print detailed progress messages"
     )
 
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Pause after script generation to allow manual editing of the JSON file"
+    )
+
+    parser.add_argument(
+        "--script-file",
+        type=Path,
+        help="Path to an existing JSON script file (skips AI generation step)"
+    )
+
     return parser.parse_args()
 
 
 # ── Pipeline Stage 1: Script Generation ───────────────────────────────────────
 
-def stage_1_generate_script(topic: str, verbose: bool) -> dict | None:
+def stage_1_generate_script(topic: str, project_dir: Path, context: str, verbose: bool) -> dict | None:
     """Generate the documentary script using Ollama."""
     print("\n" + "═" * 70)
     print("  STAGE 1: Script Generation")
     print("═" * 70)
 
-    result = brain.generate_script(topic, verbose=verbose)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    result = brain.generate_script(topic, previous_context=context, verbose=verbose)
 
     if result is None:
         print("\n❌ FAILED: Script generation failed.")
         return None
 
     # Save script to JSON for reference
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    with open(SCRIPT_FILE, "w", encoding="utf-8") as f:
+    script_file = project_dir / "script.json"
+    with open(script_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✅ Script saved to: {SCRIPT_FILE}")
+    print(f"\n✅ Script saved to: {script_file}")
     return result
 
 
 # ── Pipeline Stage 2: Voiceover + Timestamps ─────────────────────────────────
 
-def stage_2_generate_voice(narration: str, verbose: bool) -> tuple[Path | None, list | None]:
+def stage_2_generate_voice(narration: str, project_dir: Path, verbose: bool) -> tuple[Path | None, list | None]:
     """Generate TTS audio and extract word-level timestamps."""
     print("\n" + "═" * 70)
     print("  STAGE 2: Voiceover + Timestamps")
     print("═" * 70)
 
-    audio_path, caption_chunks = voice.process_voice(narration, verbose=verbose)
+    audio_path, caption_chunks = voice.process_voice(narration, output_dir=project_dir, verbose=verbose)
 
     if audio_path is None or caption_chunks is None:
         print("\n❌ FAILED: Voice processing failed.")
@@ -133,7 +158,7 @@ def stage_2_generate_voice(narration: str, verbose: bool) -> tuple[Path | None, 
 
 # ── Pipeline Stage 3: Image Generation ─────────────────────────────────────────
 
-def stage_3_generate_images(image_prompts: list, use_placeholders: bool, verbose: bool) -> list[Path]:
+def stage_3_generate_images(image_prompts: list, project_dir: Path, use_placeholders: bool, verbose: bool) -> list[Path]:
     """Generate images from prompts (or use placeholders)."""
     print("\n" + "═" * 70)
     print("  STAGE 3: Image Generation")
@@ -143,10 +168,11 @@ def stage_3_generate_images(image_prompts: list, use_placeholders: bool, verbose
         print("\n⚠️  --no-images flag detected: Using placeholder images.")
         image_paths = vision.generate_placeholder_images(
             count=len(image_prompts),
+            output_dir=project_dir,
             verbose=verbose
         )
     else:
-        image_paths = vision.generate_images(image_prompts, verbose=verbose)
+        image_paths = vision.generate_images(image_prompts, output_dir=project_dir, verbose=verbose)
 
     if not image_paths:
         print("\n❌ FAILED: No images could be generated.")
@@ -163,6 +189,7 @@ def stage_4_assemble_video(
     image_paths: list,
     audio_path: Path,
     caption_chunks: list,
+    project_dir: Path,
     verbose: bool
 ) -> Path | None:
     """Assemble the final video with Ken Burns effect and captions."""
@@ -170,10 +197,13 @@ def stage_4_assemble_video(
     print("  STAGE 4: Video Assembly")
     print("═" * 70)
 
+    output_video_path = project_dir / "final_video.mp4"
+
     output_path = assembly.assemble_video(
         image_paths=image_paths,
         audio_path=audio_path,
         caption_chunks=caption_chunks,
+        output_path=output_video_path,
         verbose=verbose
     )
 
@@ -190,7 +220,11 @@ def run_pipeline(
     topic: str,
     use_placeholders: bool = False,
     skip_video: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
+    script_context: str = None,
+    custom_output_dir: Path = None,
+    review_mode: bool = False,
+    script_file: Path = None
 ) -> bool:
     """
     Execute the full video generation pipeline.
@@ -199,6 +233,15 @@ def run_pipeline(
         True if pipeline completed successfully, False otherwise
     """
     overall_start = time.time()
+
+    if custom_output_dir:
+        project_dir = custom_output_dir
+    else:
+        project_dir = get_project_dir(topic)
+
+    # Ensure assets directory exists
+    if not ASSETS_DIR.exists():
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Welcome banner
     print("")
@@ -209,13 +252,55 @@ def run_pipeline(
     print("")
     print(f"📝 Topic: \"{topic}\"")
     print(f"🔧 Mode:  {'Placeholder images' if use_placeholders else 'AI-generated images'}")
-    print(f"📦 Output: {OUTPUT_DIR.absolute()}")
+    print(f"📦 Output: {project_dir.absolute()}")
+    
+    # Check for music
+    music_count = len(list(ASSETS_DIR.glob("*.mp3"))) + len(list(ASSETS_DIR.glob("*.wav")))
+    print(f"🎵 Music:  {music_count} tracks found in {ASSETS_DIR}")
     print("")
 
     # ── Stage 1: Script ───────────────────────────────────────────────────────
-    script = stage_1_generate_script(topic, verbose)
+    if script_file:
+        print("\n" + "═" * 70)
+        print("  STAGE 1: Script Loading (Manual Input)")
+        print("═" * 70)
+        
+        project_dir.mkdir(parents=True, exist_ok=True)
+        target_script = project_dir / "script.json"
+        
+        try:
+            shutil.copy(script_file, target_script)
+            with open(target_script, "r", encoding="utf-8") as f:
+                script = json.load(f)
+            print(f"✅ Loaded manual script from: {script_file}")
+        except Exception as e:
+            print(f"❌ Failed to load script file: {e}")
+            return False
+    else:
+        script = stage_1_generate_script(topic, project_dir, script_context, verbose)
+    
     if script is None:
         return False
+
+    # ── Review Mode Pause ─────────────────────────────────────────────────────
+    if review_mode:
+        print("\n" + "─" * 70)
+        print("  ⏸️  REVIEW MODE: Pipeline paused for manual editing.")
+        print("" + "─" * 70)
+        print(f"  The script is saved at: {project_dir / 'script.json'}")
+        print("  1. Open this file in your text editor.")
+        print("  2. Fix any hallucinations in 'narration'.")
+        print("  3. Adjust 'image_prompts' if needed.")
+        print("  4. Save the file.")
+        input("\n  Press [Enter] to reload the script and continue...")
+        
+        try:
+            with open(project_dir / "script.json", "r", encoding="utf-8") as f:
+                script = json.load(f)
+            print("  ✅ Script reloaded with your changes.")
+        except Exception as e:
+            print(f"  ❌ Failed to reload script: {e}")
+            return False
 
     title = script.get("title", "Untitled")
     narration = script["narration"]
@@ -226,12 +311,12 @@ def run_pipeline(
     print(f"🖼️  Image Prompts: {len(image_prompts)}")
 
     # ── Stage 2: Voice ─────────────────────────────────────────────────────────
-    audio_path, caption_chunks = stage_2_generate_voice(narration, verbose)
+    audio_path, caption_chunks = stage_2_generate_voice(narration, project_dir, verbose)
     if audio_path is None or caption_chunks is None:
         return False
 
     # ── Stage 3: Images ─────────────────────────────────────────────────────────
-    image_paths = stage_3_generate_images(image_prompts, use_placeholders, verbose)
+    image_paths = stage_3_generate_images(image_prompts, project_dir, use_placeholders, verbose)
     if not image_paths:
         return False
 
@@ -242,11 +327,11 @@ def run_pipeline(
         print("═" * 70)
         print("\n✅ Pipeline stopped after Stage 3.")
         print(f"   Audio:   {audio_path}")
-        print(f"   Images: {len(image_paths)} files in {OUTPUT_DIR}")
-        print(f"   Script: {SCRIPT_FILE}")
+        print(f"   Images: {len(image_paths)} files in {project_dir}")
+        print(f"   Script: {project_dir / 'script.json'}")
         return True
 
-    final_video = stage_4_assemble_video(image_paths, audio_path, caption_chunks, verbose)
+    final_video = stage_4_assemble_video(image_paths, audio_path, caption_chunks, project_dir, verbose)
     if final_video is None:
         return False
 
@@ -264,11 +349,11 @@ def run_pipeline(
     print(f"   ⏱️  Duration:   ~{minutes}m {seconds}s total")
     print("")
     print("   📁 All output files:")
-    print(f"      • {OUTPUT_DIR / 'final_video.mp4'}")
-    print(f"      • {OUTPUT_DIR / 'narration.mp3'}")
-    print(f"      • {OUTPUT_DIR / 'timestamps.json'}")
-    print(f"      • {OUTPUT_DIR / 'script.json'}")
-    for i, img in enumerate(sorted(OUTPUT_DIR.glob("image_*.png"))):
+    print(f"      • {project_dir / 'final_video.mp4'}")
+    print(f"      • {project_dir / 'narration.mp3'}")
+    print(f"      • {project_dir / 'timestamps.json'}")
+    print(f"      • {project_dir / 'script.json'}")
+    for i, img in enumerate(sorted(project_dir.glob("image_*.png"))):
         print(f"      • {img.name}")
     print("")
     print("╔" + "═" * 68 + "╗")
@@ -288,7 +373,9 @@ if __name__ == "__main__":
         topic=args.topic,
         use_placeholders=args.no_images,
         skip_video=args.no_video,
-        verbose=args.verbose
+        verbose=args.verbose,
+        review_mode=args.review,
+        script_file=args.script_file
     )
 
     sys.exit(0 if success else 1)

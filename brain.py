@@ -16,6 +16,7 @@ import json
 import time
 import subprocess
 import sys
+import re
 from typing import Optional
 
 import ollama
@@ -34,14 +35,14 @@ ART_STYLE_SUFFIX = (
 )
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a world-renowned scholar of ancient Indian history, Vedic philosophy, Sanskrit literature, and the Puranas. You have spent 40 years studying the Bhagavad Gita, Mahabharata, Ramayana, Upanishads, and the lives of legendary figures like Krishna, Arjuna, Ravana, Rama, and the great sages.
+SYSTEM_PROMPT = """You are a master storyteller of ancient Indian history and philosophy. You do not lecture; you transport the listener to the scene.
 
-Your task is to create a deeply researched, emotionally resonant, documentary-style narration for a 60-second YouTube Short. The narration must be:
-- Intellectually profound yet accessible to a modern audience
-- Historically and philosophically accurate
-- Emotionally engaging — it should give the viewer goosebumps
-- Approximately 140-160 words (perfect for 60 seconds of speech)
-- If a verse or shloka is referenced, provide: the concept in its original context, a deep English translation, and its practical meaning for personal development today
+Your task is to create a cinematic, emotionally resonant YouTube Short script.
+- **NO Academic Jargon:** Do not say "In Chapter X, Verse Y" or "The translation is".
+- **NO Bookish Tone:** Do not sound like you are reading a textbook.
+- **Storytelling First:** Start with a hook. Use active voice. Speak directly to the viewer ("You").
+- **Flow:** Use short, punchy sentences. Mix rhythm.
+- **Content:** If explaining a verse, weave the meaning naturally into the narrative.
 
 You MUST respond ONLY with a single valid JSON object. No preamble, no markdown code blocks, no explanation outside the JSON. The JSON must have exactly these three keys:
 
@@ -49,14 +50,22 @@ You MUST respond ONLY with a single valid JSON object. No preamble, no markdown 
 
 2. "narration": The complete spoken script as a single string. Write it as a documentary narrator would speak — with gravitas, pauses implied by punctuation, and a sense of ancient wisdom being revealed.
 
-3. "image_prompts": An array of exactly 5 strings. Each string is a highly descriptive visual prompt for generating a majestic, realistic ancient Indian artwork image. Each prompt must describe: the scene, the characters (if any), the mood, the lighting, and the setting. Make them cinematic and specific."""
+3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a majestic, realistic ancient Indian artwork image. Each prompt must describe: the scene, the characters (if any), the mood, the lighting, and the setting. Make them cinematic and specific."""
+
+# ── Series Outline Prompt ─────────────────────────────────────────────────────
+OUTLINE_SYSTEM_PROMPT = """You are an expert documentary showrunner.
+Your task is to break down a broad topic into a compelling {num_parts}-part series.
+
+Return ONLY a JSON object with this structure:
+{{ "series_title": "Main Title", "parts": [ {{ "part_number": 1, "title": "Part Title", "summary": "Plot points to cover..." }}, ... ] }}
+"""
 
 # ── User Prompt Template ──────────────────────────────────────────────────────
 USER_PROMPT_TEMPLATE = """Create a 60-second YouTube Short documentary script about: "{topic}"
 
 Remember:
 - The narration must be 140-160 words
-- The image_prompts array must have exactly 5 elements
+- The image_prompts array must have exactly 8 elements
 - Each image prompt should visually represent a different segment of the narration
 - Respond ONLY with the JSON object, nothing else"""
 
@@ -116,12 +125,13 @@ def _enrich_image_prompts(prompts: list) -> list:
     return enriched
 
 
-def generate_script(topic: str, verbose: bool = True) -> Optional[dict]:
+def generate_script(topic: str, previous_context: str = None, verbose: bool = True) -> Optional[dict]:
     """
     Generate a documentary script for the given topic using Ollama.
 
     Args:
         topic: The historical/philosophical topic (e.g., "Bhagavad Gita Chapter 2, Verse 47")
+        previous_context: Summary of the previous part (for series continuity)
         verbose: Whether to print progress messages
 
     Returns:
@@ -137,6 +147,9 @@ def generate_script(topic: str, verbose: bool = True) -> Optional[dict]:
         return None
 
     user_prompt = USER_PROMPT_TEMPLATE.format(topic=topic)
+    
+    if previous_context:
+        user_prompt += f"\n\nCONTEXT FROM PREVIOUS PART (CONTINUE THE STORY): {previous_context}"
 
     for attempt in range(1, MAX_RETRIES + 1):
         if verbose:
@@ -181,13 +194,13 @@ def generate_script(topic: str, verbose: bool = True) -> Optional[dict]:
             # Enrich image prompts with art style
             data["image_prompts"] = _enrich_image_prompts(data["image_prompts"])
 
-            # Ensure we have exactly 5 prompts (pad or trim)
-            while len(data["image_prompts"]) < 5:
+            # Ensure we have exactly 8 prompts (pad or trim)
+            while len(data["image_prompts"]) < 8:
                 data["image_prompts"].append(
                     f"Ancient Indian temple at golden hour, dramatic atmosphere, "
                     f"sacred geometry, divine light rays, {ART_STYLE_SUFFIX}"
                 )
-            data["image_prompts"] = data["image_prompts"][:5]
+            data["image_prompts"] = data["image_prompts"][:8]
 
             if verbose:
                 word_count = len(data["narration"].split())
@@ -219,6 +232,51 @@ def generate_script(topic: str, verbose: bool = True) -> Optional[dict]:
 
     print(f"\n   ❌ Failed to generate script after {MAX_RETRIES} attempts.")
     return None
+
+
+def generate_series_outline(topic: str, num_parts: int, verbose: bool = True) -> Optional[dict]:
+    """Generate a structured outline for a multi-part series."""
+    if verbose:
+        print(f"\n🧠 [brain.py] Generating outline for {num_parts}-part series: \"{topic}\"")
+
+    if not _ensure_ollama_running():
+        return None
+
+    system_prompt = OUTLINE_SYSTEM_PROMPT.format(num_parts=num_parts)
+    user_prompt = f"Create a {num_parts}-part outline for: {topic}"
+
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            format="json",
+            options={"temperature": 0.7}
+        )
+        
+        raw_content = response["message"]["content"].strip()
+        
+        # Clean up potential markdown
+        if raw_content.startswith("```"):
+            lines = raw_content.split("\n")
+            raw_content = "\n".join(line for line in lines if not line.strip().startswith("```"))
+
+        data = json.loads(raw_content)
+        
+        if "parts" not in data or not isinstance(data["parts"], list):
+            print("   ❌ Invalid outline format received.")
+            return None
+            
+        if verbose:
+            print(f"   ✅ Outline generated: {len(data['parts'])} parts")
+            
+        return data
+
+    except Exception as e:
+        print(f"   ❌ Failed to generate outline: {e}")
+        return None
 
 
 # ── CLI Entry Point ───────────────────────────────────────────────────────────

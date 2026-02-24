@@ -26,6 +26,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import (
     AudioFileClip,
+    CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
     VideoClip,
@@ -33,12 +34,14 @@ from moviepy.editor import (
     concatenate_videoclips,
 )
 from moviepy.video.fx.all import fadein, fadeout
+from moviepy.audio.fx.all import audio_loop, audio_fadeout
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
 AUDIO_FILE = OUTPUT_DIR / "narration.mp3"
 TIMESTAMPS_FILE = OUTPUT_DIR / "timestamps.json"
 FINAL_VIDEO = OUTPUT_DIR / "final_video.mp4"
+MUSIC_DIR = Path("assets/music")
 
 # Video specs — YouTube Shorts standard
 VIDEO_WIDTH = 1080
@@ -51,13 +54,13 @@ PAN_RANGE_X = 40          # Max horizontal pan in pixels
 PAN_RANGE_Y = 25          # Max vertical pan in pixels
 
 # Image display timing
-MIN_IMAGE_DURATION = 8.0   # seconds
+MIN_IMAGE_DURATION = 5.0   # seconds (Lowered to allow 8-10 images per minute)
 MAX_IMAGE_DURATION = 12.0  # seconds
 CROSSFADE_DURATION = 0.6   # seconds
 
 # Caption styling
 CAPTION_FONT_SIZE = 72
-CAPTION_Y_POSITION = 0.62  # 62% from top (center-lower area)
+CAPTION_Y_POSITION = 0.75  # 75% from top (bottom-center area)
 CAPTION_STROKE_WIDTH = 6
 CAPTION_COLOR = (255, 255, 255)       # White
 CAPTION_STROKE_COLOR = (0, 0, 0)      # Black
@@ -206,17 +209,57 @@ def _render_caption_frame(
     canvas = Image.new("RGBA", frame_size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
+    # 1. Word Wrap Logic
+    max_width = int(frame_size[0] * 0.85)  # 85% safe zone
+    words = text.split()
+    lines = []
+    current_line = []
 
-    x = (frame_size[0] - text_w) // 2
-    y = int(frame_size[1] * CAPTION_Y_POSITION) - text_h // 2
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        w = bbox[2] - bbox[0]
+        
+        if w <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+    
+    if current_line:
+        lines.append(" ".join(current_line))
 
-    bg_x1 = x - CAPTION_BG_PADDING
-    bg_y1 = y - CAPTION_BG_PADDING
-    bg_x2 = x + text_w + CAPTION_BG_PADDING
-    bg_y2 = y + text_h + CAPTION_BG_PADDING
+    if not lines:
+        return np.array(canvas)
+
+    # 2. Calculate Dimensions
+    line_metrics = []
+    total_h = 0
+    max_w = 0
+    line_spacing = 10
+
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        line_metrics.append((line, w, h))
+        max_w = max(max_w, w)
+        total_h += h
+
+    total_h += (len(lines) - 1) * line_spacing
+
+    # 3. Position (Bottom Center)
+    center_x = frame_size[0] // 2
+    center_y = int(frame_size[1] * CAPTION_Y_POSITION)
+    start_y = center_y - total_h // 2
+
+    # 4. Draw Background
+    bg_x1 = center_x - max_w // 2 - CAPTION_BG_PADDING
+    bg_y1 = start_y - CAPTION_BG_PADDING
+    bg_x2 = center_x + max_w // 2 + CAPTION_BG_PADDING
+    bg_y2 = start_y + total_h + CAPTION_BG_PADDING
+
     draw.rounded_rectangle(
         [bg_x1, bg_y1, bg_x2, bg_y2],
         radius=15,
@@ -233,15 +276,24 @@ def _render_caption_frame(
         (0, CAPTION_STROKE_WIDTH),
         (CAPTION_STROKE_WIDTH, CAPTION_STROKE_WIDTH),
     ]
-    for ox, oy in stroke_offsets:
-        draw.text(
-            (x + ox, y + oy),
-            text,
-            font=font,
-            fill=(*CAPTION_STROKE_COLOR, 255)
-        )
 
-    draw.text((x, y), text, font=font, fill=(*CAPTION_COLOR, 255))
+    # 5. Draw Text Lines
+    current_y = start_y
+    for line, w, h in line_metrics:
+        x = center_x - w // 2
+        
+        # Draw stroke
+        for ox, oy in stroke_offsets:
+            draw.text(
+                (x + ox, current_y + oy),
+                line,
+                font=font,
+                fill=(*CAPTION_STROKE_COLOR, 255)
+            )
+        
+        # Draw fill
+        draw.text((x, current_y), line, font=font, fill=(*CAPTION_COLOR, 255))
+        current_y += h + line_spacing
 
     return np.array(canvas)
 
@@ -299,7 +351,7 @@ def assemble_video(
         print(f"   Images: {len(image_paths)}")
         print(f"   Captions: {len(caption_chunks)} chunks")
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load Audio
     if verbose:
@@ -389,7 +441,37 @@ def assemble_video(
     # Final Composite
     all_clips = [background] + caption_clips
     final_video = CompositeVideoClip(all_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
-    final_video = final_video.set_audio(audio_clip)
+    
+    # ── Background Music Mixing ───────────────────────────────────────────────
+    final_audio = audio_clip
+    
+    if MUSIC_DIR.exists():
+        import random
+        music_files = list(MUSIC_DIR.glob("*.mp3")) + list(MUSIC_DIR.glob("*.wav"))
+        
+        if music_files:
+            music_path = random.choice(music_files)
+            if verbose:
+                print(f"   🎵 Adding background music: {music_path.name}")
+            
+            try:
+                bg_music = AudioFileClip(str(music_path))
+                
+                # Loop if music is shorter than video
+                if bg_music.duration < total_duration:
+                    bg_music = audio_loop(bg_music, duration=total_duration)
+                else:
+                    bg_music = bg_music.subclip(0, total_duration)
+                
+                # Lower volume (15%) and fade out at end
+                bg_music = bg_music.volumex(0.15)
+                bg_music = audio_fadeout(bg_music, 2.0)
+                
+                final_audio = CompositeAudioClip([audio_clip, bg_music])
+            except Exception as e:
+                print(f"   ⚠️  Failed to mix background music: {e}")
+
+    final_video = final_video.set_audio(final_audio)
     final_video = final_video.set_duration(total_duration)
 
     # Render to File

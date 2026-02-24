@@ -101,6 +101,12 @@ You'll know it's active when you see `(venv)` at the beginning of your terminal 
 # Full pipeline (requires Draw Things running)
 python main.py "Bhagavad Gita Chapter 2, Verse 47"
 
+# Review script before generating (prevents hallucinations)
+python main.py "The rise of Ravana" --review
+
+# Use your own pre-written script (bypassing AI generation)
+python main.py "My Custom Topic" --script-file my_script.json
+
 # With placeholder images (no Draw Things needed)
 python main.py --no-images "The rise of Ravana"
 
