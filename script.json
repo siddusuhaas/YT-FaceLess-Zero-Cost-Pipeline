@@ -1,40 +1,41 @@
 {
-  "title": "Why You Must Let Go of the Result",
-  "narration": "Your hands tremble as you fall to your knees in the dust. You stand on the battlefield of Kurukshetra, paralyzed. Warrior Arjuna sees his own family standing against him. The weight of the coming slaughter crushes his spirit. Why fight if victory feels like ash? Why act at all? Then, the chariot driver speaks over the roaring war horns. Krishna points toward the enemy lines. He does not promise victory. He does not promise a kingdom. He reveals the timeless truth. You have the right to your actions, but never to the fruits of those actions. Let go of the reward. Let go of the failure. The result is an illusion. Your only duty is to act with absolute purpose right now. When you stop staring at the horizon, the fear vanishes. You simply breathe, stand up, and prepare for what comes next, even as your hands tremble.",
-  "description": "What if success and failure are both illusions? Discover the timeless ancient philosophy that frees you from the paralyzing fear of outcomes. When we focus only on the action itself, true purpose begins.",
+  "title": "The Tragic Truth That Broke Karna",
+  "narration": "Karna stares down at his trembling hands, the golden armor heavy on his chest. For a lifetime, they called you lowborn. A charioteer’s son who bled twice as much just to stand on the battlefield. You built your worth on loyalty to the one man who accepted you. Then the truth shatters your world. Kunti speaks the words. You are her firstborn. The eldest Pandava. The very brothers you swore to destroy are your own flesh and blood. The crown of the empire belongs to you by right. But what is blood when it abandoned you? Krishna smiles gently. He asks you to choose between the throne of dharma and the chains of loyalty. You realize true honor is not given by birth, nor taken by kings. It is forged in the fire of keeping your word, even when doom is certain. Even as you raise your bow, feeling the golden armor heavy on your chest.",
+  "description": "Imagine finding out the enemy you swore to destroy is your own flesh and blood. The tragic, untold devastation of Karna when he learns he is the eldest Pandava.",
   "hashtags": [
     "#Mahabharata",
-    "#BhagavadGita",
+    "#Karna",
     "#Krishna",
-    "#Arjuna",
     "#IndianMythology",
+    "#Dharma",
     "#Shorts"
   ],
   "tags": [
-    "Bhagavad Gita story",
-    "Krishna and Arjuna",
+    "Mahabharata Karna story",
+    "Karna and Kunti",
+    "Karna true identity",
     "Indian epic stories",
     "Hindu philosophy explained",
-    "motivational mythology"
+    "tragic hero"
   ],
   "image_prompts": [
-    "warrior Arjuna wearing golden armor holding a large bow kneeling down. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "warrior Arjuna wearing golden armor holding a large bow turning away. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "blue-skinned man Krishna wearing yellow dhoti and peacock feather crown pointing. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "blue-skinned man Krishna wearing yellow dhoti and peacock feather crown speaking. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "warrior Arjuna wearing golden armor holding a large bow looking up. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "blue-skinned man Krishna wearing yellow dhoti and peacock feather crown driving. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "warrior Arjuna wearing golden armor holding a large bow pulling bowstring. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading.",
-    "warrior Arjuna wearing golden armor holding a large bow rising up. Amar Chitra Katha comic style, vibrant flat colors, bold black outlines, simple comic shading."
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, light brown-skinned tall muscular male warrior Karna, shoulder-length wavy black hair, golden armor fused to chest, golden earrings, white dhoti, staring down at his outstretched hands, riverbank at dusk, deep orange sunset backlight",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, light brown-skinned tall muscular male warrior Karna, shoulder-length wavy black hair, golden armor fused to chest, golden earrings, white dhoti, raising a heavy wooden bow above his head, dusty tournament arena, harsh noon sunlight",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, fair-skinned older woman Kunti, silver-streaked black hair, simple white silk saree, bare neck, reaching her hands toward Karna, quiet riverbank, soft evening twilight",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, light brown-skinned tall muscular male warrior Karna, shoulder-length wavy black hair, golden armor fused to chest, golden earrings, white dhoti, stepping backward with hands raised defensively, quiet riverbank, soft evening twilight",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, brown-skinned muscular male warrior Arjuna, long straight black hair, clean-shaven sharp face, ornate golden chest plate armor, golden upper arm bands, white dhoti, large golden recurve bow, drawing arrow on chariot, sprawling battlefield, dramatic storm clouds overhead",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, blue-skinned slim young male Krishna, short curly black hair, peacock feather in golden crown, yellow silk dhoti, bare chest with tulsi bead necklace, gentle smiling face, resting a hand on Karna's shoulder, dense forest clearing, dappled sunlight through leaves",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, light brown-skinned tall muscular male warrior Karna, shoulder-length wavy black hair, golden armor fused to chest, golden earrings, white dhoti, gripping a spear tightly, rocky cliff edge, fierce crimson sunrise",
+    "Amar Chitra Katha comic book panel, vibrant flat colors, bold black ink outlines, cel-shaded, light brown-skinned tall muscular male warrior Karna, shoulder-length wavy black hair, golden armor fused to chest, golden earrings, white dhoti, looking down at his armored chest, riverbank at dusk, deep orange sunset backlight"
   ],
   "scene_timing": [
     3,
-    7,
+    6,
     7,
     8,
     10,
     10,
-    8,
-    7
+    7,
+    6
   ]
 }

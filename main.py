@@ -190,7 +190,8 @@ def stage_4_assemble_video(
     audio_path: Path,
     caption_chunks: list,
     project_dir: Path,
-    verbose: bool
+    verbose: bool,
+    scene_timing: list = None
 ) -> Path | None:
     """Assemble the final video with Ken Burns effect and captions."""
     print("\n" + "═" * 70)
@@ -203,6 +204,7 @@ def stage_4_assemble_video(
         image_paths=image_paths,
         audio_path=audio_path,
         caption_chunks=caption_chunks,
+        scene_timing=scene_timing,
         output_path=output_video_path,
         verbose=verbose
     )
@@ -310,10 +312,13 @@ def run_pipeline(
     title = script.get("title", "Untitled")
     narration = script["narration"]
     image_prompts = script["image_prompts"]
+    scene_timing = script.get("scene_timing")
 
     print(f"\n📋 Generated Title: {title}")
     print(f"📝 Narration: {len(narration.split())} words")
     print(f"🖼️  Image Prompts: {len(image_prompts)}")
+    if scene_timing:
+        print(f"⏱️  Scene Timing: {scene_timing}")
 
     # ── Stage 2: Voice ─────────────────────────────────────────────────────────
     audio_path, caption_chunks = stage_2_generate_voice(narration, project_dir, verbose)
@@ -336,7 +341,7 @@ def run_pipeline(
         print(f"   Script: {project_dir / 'script.json'}")
         return True
 
-    final_video = stage_4_assemble_video(image_paths, audio_path, caption_chunks, project_dir, verbose)
+    final_video = stage_4_assemble_video(image_paths, audio_path, caption_chunks, project_dir, verbose, scene_timing=scene_timing)
     if final_video is None:
         return False
 

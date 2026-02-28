@@ -11,7 +11,7 @@ Given a topic like *"Bhagavad Gita Chapter 2, Verse 47"* or *"The rise of Ravana
 1. **Script** — AI-generated documentary narration with historian/philosopher tone
 2. **Voiceover** — Neural TTS audio using Microsoft Edge TTS
 3. **Word Timestamps** — Whisper-powered transcription for sync captions
-4. **Images** — AI-generated ancient Indian artwork (via Draw Things)
+4. **Images** — AI-generated ancient Indian artwork (via Draw Things using FLUX.1 [schnell])
 5. **Final Video** — 1080×1920 vertical video with Ken Burns effect + dynamic captions
 
 ---
@@ -28,8 +28,8 @@ Given a topic like *"Bhagavad Gita Chapter 2, Verse 47"* or *"The rise of Ravana
 | Service | Purpose | How to Install/Run |
 |---------|---------|-------------------|
 | **FFmpeg** | Video processing | `brew install ffmpeg` |
-| **Ollama** | Local LLM for script generation | `brew install ollama` |
-| **Draw Things** | AI image generation (optional) | Download from App Store, enable HTTP API on port 7888 |
+| **Ollama** | Local LLM (llama3.2:3b) | `brew install ollama` |
+| **Draw Things** | AI image generation (FLUX.1 [schnell]) | Download from App Store, enable HTTP API on port 7888 |
 
 ---
 
@@ -276,7 +276,7 @@ When you run `python main.py "Your Topic"`, here's what happens:
 | **Script Generation** | Ollama with custom historian/philosopher system prompt |
 | **Voiceover** | Microsoft Edge TTS (en-IN-NeerjaNeural - Indian English) |
 | **Timestamps** | mlx-whisper (Apple Neural Engine optimized) |
-| **Image Generation** | Draw Things API (port 7888) with Stable Diffusion |
+| **Image Generation** | Draw Things API (port 7888) with FLUX.1 [schnell] |
 | **Video Effects** | Ken Burns (slow zoom/pan), crossfades |
 | **Captions** | Word-synced, white text with black outline |
 | **Output Format** | 1080×1920 (9:16 vertical), H.264, AAC audio |
@@ -341,7 +341,7 @@ This project is for educational and personal use. Generated content should compl
 - **Ollama** — Local LLM (https://ollama.ai)
 - **Edge TTS** — Microsoft Neural TTS
 - **mlx-whisper** — Apple Silicon optimized whisper
-- **Draw Things** — Stable Diffusion on Mac
+- **Draw Things** — FLUX.1 [schnell] on Mac
 - **MoviePy** — Video processing
 
 ---

@@ -8,8 +8,14 @@ Output JSON schema:
 {
     "title": str,           # Click-worthy YouTube title
     "narration": str,       # Full spoken script (~60 seconds)
-    "image_prompts": list   # 5-6 descriptive art prompts
+    "image_prompts": list   # 8 descriptive art prompts
+    "scene_timing": list    # 8 per-image durations in seconds
 }
+
+CHANGES FROM v1:
+  - enrich_image_prompts() now uses keyword detection instead of exact string match.
+    This prevents double-appending style suffixes when prompts come from Gemini,
+    which already adds "Amar Chitra Katha" style text.
 """
 
 import json
@@ -27,13 +33,28 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 
 # ── Art Style Suffix ──────────────────────────────────────────────────────────
-# Appended to every image prompt for consistent visual style
+# Appended to every image prompt ONLY IF the prompt doesn't already contain
+# comic/style keywords. This prevents double-styling Gemini-generated prompts.
 ART_STYLE_SUFFIX = (
     "Amar Chitra Katha comic book style, vibrant digital illustration, "
     "bold black outlines, cel shaded, 2D animation, flat colors, "
     "hindu mythology art, expressive characters, "
     "no photorealism, no shading, no 3d render"
 )
+
+# ✅ FIX: Keywords used to detect if a prompt already has a style instruction.
+# If ANY of these are found in the prompt, we skip appending the suffix.
+STYLE_DETECTION_KEYWORDS = [
+    "amar chitra",
+    "comic style",
+    "comic book",
+    "flat colors",
+    "bold black outlines",
+    "cel shad",
+    "2d animation",
+    "vibrant flat",
+    "vibrant digital",
+]
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a master storyteller of ancient Indian history and philosophy. You do not lecture; you transport the listener to the scene.
@@ -129,14 +150,33 @@ def _validate_script(data: dict) -> tuple[bool, str]:
     return True, "OK"
 
 
+def _prompt_already_styled(prompt: str) -> bool:
+    """
+    ✅ FIX: Check if a prompt already contains style instructions.
+    Uses keyword detection instead of exact string match, so it correctly
+    identifies Gemini-generated prompts that use slightly different wording.
+    """
+    prompt_lower = prompt.lower()
+    return any(keyword in prompt_lower for keyword in STYLE_DETECTION_KEYWORDS)
+
+
 def enrich_image_prompts(prompts: list) -> list:
-    """Append the art style suffix to each image prompt."""
+    """
+    Append the art style suffix to each image prompt — but ONLY if the prompt
+    doesn't already contain style keywords.
+
+    ✅ FIX: Previously used exact string match which always failed for Gemini prompts,
+    causing every prompt to get the suffix appended twice with conflicting wording.
+    Now uses keyword detection so Gemini prompts are left untouched.
+    """
     enriched = []
     for prompt in prompts:
-        if ART_STYLE_SUFFIX.lower() not in prompt.lower():
-            enriched.append(f"{prompt.rstrip('. ')}, {ART_STYLE_SUFFIX}")
-        else:
+        if _prompt_already_styled(prompt):
+            # Already has style instructions (e.g. from Gemini) — leave as-is
             enriched.append(prompt)
+        else:
+            # No style detected — append our suffix
+            enriched.append(f"{prompt.rstrip('. ')}, {ART_STYLE_SUFFIX}")
     return enriched
 
 
@@ -150,19 +190,18 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
         verbose: Whether to print progress messages
 
     Returns:
-        dict with keys: title, narration, image_prompts
+        dict with keys: title, narration, image_prompts, scene_timing
         None if generation fails after all retries
     """
     if verbose:
         print(f"\n🧠 [brain.py] Generating script for: \"{topic}\"")
         print(f"   Model: {OLLAMA_MODEL}")
 
-    # Ensure Ollama is running
     if not _ensure_ollama_running():
         return None
 
     user_prompt = USER_PROMPT_TEMPLATE.format(topic=topic)
-    
+
     if previous_context:
         user_prompt += f"\n\nCONTEXT FROM PREVIOUS PART (CONTINUE THE STORY): {previous_context}"
 
@@ -187,7 +226,6 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
 
             raw_content = response["message"]["content"].strip()
 
-            # Strip markdown code fences if the model added them anyway
             if raw_content.startswith("```"):
                 lines = raw_content.split("\n")
                 raw_content = "\n".join(
@@ -195,10 +233,8 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
                     if not line.strip().startswith("```")
                 )
 
-            # Parse JSON
             data = json.loads(raw_content)
 
-            # Validate structure
             is_valid, error_msg = _validate_script(data)
             if not is_valid:
                 if verbose:
@@ -206,7 +242,7 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
                 time.sleep(RETRY_DELAY)
                 continue
 
-            # Enrich image prompts with art style
+            # Enrich image prompts with art style (smart — won't double-apply)
             data["image_prompts"] = enrich_image_prompts(data["image_prompts"])
 
             # Ensure we have exactly 8 prompts (pad or trim)
@@ -229,6 +265,8 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
                 print(f"   📋 Title: {data['title']}")
                 print(f"   📝 Narration: {word_count} words")
                 print(f"   🎨 Image prompts: {len(data['image_prompts'])}")
+                if "scene_timing" in data:
+                    print(f"   ⏱️  Scene timing: {data['scene_timing']} (total: {sum(data['scene_timing'])}s)")
 
             return data
 
@@ -276,23 +314,22 @@ def generate_series_outline(topic: str, num_parts: int, verbose: bool = True) ->
             format="json",
             options={"temperature": 0.7}
         )
-        
+
         raw_content = response["message"]["content"].strip()
-        
-        # Clean up potential markdown
+
         if raw_content.startswith("```"):
             lines = raw_content.split("\n")
             raw_content = "\n".join(line for line in lines if not line.strip().startswith("```"))
 
         data = json.loads(raw_content)
-        
+
         if "parts" not in data or not isinstance(data["parts"], list):
             print("   ❌ Invalid outline format received.")
             return None
-            
+
         if verbose:
             print(f"   ✅ Outline generated: {len(data['parts'])} parts")
-            
+
         return data
 
     except Exception as e:

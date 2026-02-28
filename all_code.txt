@@ -1,0 +1,1777 @@
+### FILE: assembly.py ###
+
+"""
+assembly.py — Module 4: Video Assembly with Ken Burns Effect + Dynamic Captions
+=================================================================================
+Assembles the final YouTube Short (1080×1920, 9:16) from:
+  - Audio: output/narration.mp3
+  - Images: output/image_0.png ... image_N.png
+  - Timestamps: output/timestamps.json
+
+Features:
+  - Ken Burns effect (slow zoom/pan) on every image
+  - Image swap every 8-12 seconds with crossfade
+  - Word-level dynamic captions burned into video center
+  - White text with thick black stroke (anti-slop style)
+  - Final render: output/final_video.mp4 (H.264, AAC audio)
+"""
+
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeAudioClip,
+    CompositeVideoClip,
+    ImageClip,
+    VideoClip,
+    VideoFileClip,
+    concatenate_videoclips,
+)
+from moviepy.video.fx.all import fadein, fadeout
+from moviepy.audio.fx.all import audio_loop, audio_fadeout
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+OUTPUT_DIR = Path("output")
+AUDIO_FILE = OUTPUT_DIR / "narration.mp3"
+TIMESTAMPS_FILE = OUTPUT_DIR / "timestamps.json"
+FINAL_VIDEO = OUTPUT_DIR / "final_video.mp4"
+MUSIC_DIR = Path("assets/music")
+
+# Video specs — YouTube Shorts standard
+VIDEO_WIDTH = 1080
+VIDEO_HEIGHT = 1920
+VIDEO_FPS = 30
+
+# Ken Burns settings
+ZOOM_FACTOR = 1.12        # Max zoom level (12% zoom-in)
+PAN_RANGE_X = 40          # Max horizontal pan in pixels
+PAN_RANGE_Y = 25          # Max vertical pan in pixels
+
+# Image display timing
+MIN_IMAGE_DURATION = 5.0   # seconds (Lowered to allow 8-10 images per minute)
+MAX_IMAGE_DURATION = 12.0  # seconds
+CROSSFADE_DURATION = 0.6   # seconds
+
+# Caption styling
+CAPTION_FONT_SIZE = 72
+CAPTION_Y_POSITION = 0.75  # 75% from top (bottom-center area)
+CAPTION_STROKE_WIDTH = 6
+CAPTION_COLOR = (255, 255, 255)       # White
+CAPTION_STROKE_COLOR = (0, 0, 0)      # Black
+CAPTION_BG_ALPHA = 140                # Semi-transparent background (0-255)
+CAPTION_BG_PADDING = 20              # Pixels of padding around text
+
+
+# ── Font Loading ──────────────────────────────────────────────────────────────
+
+def _get_font(size: int) -> ImageFont.FreeTypeFont:
+    """Load a bold font, falling back through common system fonts."""
+    font_candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Impact.ttf",
+        "/System/Library/Fonts/SFNSDisplay-Bold.otf",
+        "/System/Library/Fonts/SFNS.ttf",
+    ]
+    for font_path in font_candidates:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+    # Ultimate fallback: PIL default (no stroke, but won't crash)
+    return ImageFont.load_default()
+
+
+# ── Image Preprocessing ───────────────────────────────────────────────────────
+
+def _prepare_image(image_path: Path) -> np.ndarray:
+    """
+    Load and resize image to fill the video canvas (cover mode).
+    Returns numpy array of shape (VIDEO_HEIGHT, VIDEO_WIDTH, 3).
+    """
+    img = Image.open(str(image_path)).convert("RGB")
+    orig_w, orig_h = img.size
+
+    # Scale to cover the canvas (maintain aspect ratio, crop excess)
+    # Add extra margin for Ken Burns zoom headroom
+    target_w = int(VIDEO_WIDTH * ZOOM_FACTOR) + PAN_RANGE_X * 2
+    target_h = int(VIDEO_HEIGHT * ZOOM_FACTOR) + PAN_RANGE_Y * 2
+
+    scale = max(target_w / orig_w, target_h / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Center crop to target size
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    img = img.crop((left, top, left + target_w, top + target_h))
+
+    # Convert to numpy array
+    img_array = np.array(img)
+    # Ensure it's a 3D array (H, W, C)
+    if len(img_array.shape) == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    return img_array
+
+
+# ── Ken Burns Effect ──────────────────────────────────────────────────────────
+
+class KenBurnsClip(VideoClip):
+    """
+    Custom VideoClip that applies Ken Burns (slow zoom + pan) effect.
+    """
+    def __init__(self, img_array: np.ndarray, duration: float, direction: int = 0):
+        super().__init__()
+        self.img = img_array
+        self.duration = duration
+        self.fps = VIDEO_FPS
+        
+        # Get image dimensions
+        self.src_h, self.src_w = img_array.shape[:2]
+        
+        # Define start/end zoom and pan based on direction
+        directions = [
+            (1.0, ZOOM_FACTOR, 0, PAN_RANGE_X, 0, PAN_RANGE_Y),
+            (ZOOM_FACTOR, 1.0, PAN_RANGE_X, 0, PAN_RANGE_Y, 0),
+            (1.0, ZOOM_FACTOR, PAN_RANGE_X, 0, 0, PAN_RANGE_Y),
+            (ZOOM_FACTOR, 1.0, 0, PAN_RANGE_X, PAN_RANGE_Y, 0),
+        ]
+        self.start_z, self.end_z, self.spx, self.epx, self.spy, self.epy = directions[direction % 4]
+        
+    def make_frame(self, t: float) -> np.ndarray:
+        """Generate a single frame at time t with Ken Burns transform."""
+        progress = t / self.duration
+
+        # Interpolate zoom and pan
+        zoom = self.start_z + (self.end_z - self.start_z) * progress
+        pan_x = int(self.spx + (self.epx - self.spx) * progress)
+        pan_y = int(self.spy + (self.epy - self.spy) * progress)
+
+        # Calculate crop dimensions at current zoom level
+        crop_w = int(VIDEO_WIDTH / zoom)
+        crop_h = int(VIDEO_HEIGHT / zoom)
+
+        # Center of the source image
+        center_x = self.src_w // 2 + pan_x
+        center_y = self.src_h // 2 + pan_y
+
+        # Crop coordinates
+        x1 = max(0, center_x - crop_w // 2)
+        y1 = max(0, center_y - crop_h // 2)
+        x2 = min(self.src_w, x1 + crop_w)
+        y2 = min(self.src_h, y1 + crop_h)
+
+        # Adjust if we hit boundaries
+        if x2 - x1 < crop_w:
+            x1 = max(0, x2 - crop_w)
+        if y2 - y1 < crop_h:
+            y1 = max(0, y2 - crop_h)
+
+        # Crop and resize to video dimensions
+        cropped = self.img[y1:y2, x1:x2]
+        frame_img = Image.fromarray(cropped).resize(
+            (VIDEO_WIDTH, VIDEO_HEIGHT), Image.BILINEAR
+        )
+        return np.array(frame_img)
+
+
+def _make_ken_burns_clip(
+    image_path: Path,
+    duration: float,
+    direction: int = 0,
+) -> KenBurnsClip:
+    """
+    Create a Ken Burns (slow zoom + pan) video clip from a single image.
+    """
+    img_array = _prepare_image(image_path)
+    return KenBurnsClip(img_array, duration, direction)
+
+
+# ── Caption Frame Renderer ────────────────────────────────────────────────────
+
+def _render_caption_frame(
+    text: str,
+    frame_size: tuple = (VIDEO_WIDTH, VIDEO_HEIGHT),
+) -> np.ndarray:
+    """Render a single caption frame as a transparent RGBA numpy array."""
+    font = _get_font(CAPTION_FONT_SIZE)
+
+    canvas = Image.new("RGBA", frame_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    # 1. Word Wrap Logic
+    max_width = int(frame_size[0] * 0.85)  # 85% safe zone
+    words = text.split()
+    lines = []
+    current_line = []
+
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        w = bbox[2] - bbox[0]
+        
+        if w <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+    
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    if not lines:
+        return np.array(canvas)
+
+    # 2. Calculate Dimensions
+    line_metrics = []
+    total_h = 0
+    max_w = 0
+    line_spacing = 10
+
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        line_metrics.append((line, w, h))
+        max_w = max(max_w, w)
+        total_h += h
+
+    total_h += (len(lines) - 1) * line_spacing
+
+    # 3. Position (Bottom Center)
+    center_x = frame_size[0] // 2
+    center_y = int(frame_size[1] * CAPTION_Y_POSITION)
+    start_y = center_y - total_h // 2
+
+    # 4. Draw Background
+    bg_x1 = center_x - max_w // 2 - CAPTION_BG_PADDING
+    bg_y1 = start_y - CAPTION_BG_PADDING
+    bg_x2 = center_x + max_w // 2 + CAPTION_BG_PADDING
+    bg_y2 = start_y + total_h + CAPTION_BG_PADDING
+
+    draw.rounded_rectangle(
+        [bg_x1, bg_y1, bg_x2, bg_y2],
+        radius=15,
+        fill=(0, 0, 0, CAPTION_BG_ALPHA)
+    )
+
+    stroke_offsets = [
+        (-CAPTION_STROKE_WIDTH, -CAPTION_STROKE_WIDTH),
+        (0, -CAPTION_STROKE_WIDTH),
+        (CAPTION_STROKE_WIDTH, -CAPTION_STROKE_WIDTH),
+        (-CAPTION_STROKE_WIDTH, 0),
+        (CAPTION_STROKE_WIDTH, 0),
+        (-CAPTION_STROKE_WIDTH, CAPTION_STROKE_WIDTH),
+        (0, CAPTION_STROKE_WIDTH),
+        (CAPTION_STROKE_WIDTH, CAPTION_STROKE_WIDTH),
+    ]
+
+    # 5. Draw Text Lines
+    current_y = start_y
+    for line, w, h in line_metrics:
+        x = center_x - w // 2
+        
+        # Draw stroke
+        for ox, oy in stroke_offsets:
+            draw.text(
+                (x + ox, current_y + oy),
+                line,
+                font=font,
+                fill=(*CAPTION_STROKE_COLOR, 255)
+            )
+        
+        # Draw fill
+        draw.text((x, current_y), line, font=font, fill=(*CAPTION_COLOR, 255))
+        current_y += h + line_spacing
+
+    return np.array(canvas)
+
+
+# ── Caption Clip Builder ──────────────────────────────────────────────────────
+
+def _build_caption_clips(
+    caption_chunks: list,
+    total_duration: float,
+) -> list:
+    """Build a list of MoviePy ImageClips for each caption chunk."""
+    caption_clips = []
+
+    for chunk in caption_chunks:
+        text = chunk["text"].strip()
+        start = chunk["start"]
+        end = min(chunk["end"], total_duration)
+        duration = end - start
+
+        if duration <= 0 or not text:
+            continue
+
+        frame_rgba = _render_caption_frame(text)
+        frame_rgb = frame_rgba[:, :, :3]
+        frame_alpha = frame_rgba[:, :, 3] / 255.0
+
+        caption_clip = (
+            ImageClip(frame_rgb, ismask=False)
+            .set_start(start)
+            .set_duration(duration)
+            .set_opacity(1.0)
+        )
+
+        mask_clip = ImageClip(frame_alpha, ismask=True).set_duration(duration)
+        caption_clip = caption_clip.set_mask(mask_clip).set_start(start)
+
+        caption_clips.append(caption_clip)
+
+    return caption_clips
+
+
+# ── Main Assembly Function ────────────────────────────────────────────────────
+
+def assemble_video(
+    image_paths: list,
+    audio_path: Path,
+    caption_chunks: list,
+    output_path: Path = FINAL_VIDEO,
+    verbose: bool = True,
+) -> Optional[Path]:
+    """Assemble the final YouTube Short video."""
+    if verbose:
+        print(f"\n🎬 [assembly.py] Assembling final video...")
+        print(f"   Canvas: {VIDEO_WIDTH}×{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
+        print(f"   Images: {len(image_paths)}")
+        print(f"   Captions: {len(caption_chunks)} chunks")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load Audio
+    if verbose:
+        print(f"\n   📻 Loading audio: {audio_path}")
+    try:
+        audio_clip = AudioFileClip(str(audio_path))
+        total_duration = audio_clip.duration
+        if verbose:
+            print(f"   ✅ Audio duration: {total_duration:.1f}s")
+    except Exception as e:
+        print(f"   ❌ Failed to load audio: {e}")
+        return None
+
+    if not image_paths:
+        print("   ❌ No images provided for assembly.")
+        return None
+
+    num_images = len(image_paths)
+    base_duration = total_duration / num_images
+    image_duration = max(MIN_IMAGE_DURATION, min(MAX_IMAGE_DURATION, base_duration))
+
+    if verbose:
+        print(f"\n   🖼️  Building {num_images} Ken Burns clips ({image_duration:.1f}s each)...")
+
+    # Build Ken Burns Clips
+    kb_clips = []
+    current_time = 0.0
+
+    for i, img_path in enumerate(image_paths):
+        if i == num_images - 1:
+            clip_duration = max(MIN_IMAGE_DURATION, total_duration - current_time + CROSSFADE_DURATION)
+        else:
+            clip_duration = image_duration + CROSSFADE_DURATION
+
+        if verbose:
+            print(f"   [{i+1}/{num_images}] Ken Burns on {img_path.name} ({clip_duration:.1f}s)...")
+
+        try:
+            kb_clip = _make_ken_burns_clip(
+                image_path=img_path,
+                duration=clip_duration,
+                direction=i,
+            )
+            kb_clip = kb_clip.set_fps(VIDEO_FPS)
+
+            if i > 0:
+                kb_clip = fadein(kb_clip, CROSSFADE_DURATION)
+            if i < num_images - 1:
+                kb_clip = fadeout(kb_clip, CROSSFADE_DURATION)
+
+            kb_clip = kb_clip.set_start(current_time)
+            kb_clips.append(kb_clip)
+
+        except Exception as e:
+            print(f"   ⚠️  Ken Burns failed for image {i+1}: {e}")
+            try:
+                img_array = _prepare_image(img_path)
+                static_clip = (
+                    ImageClip(img_array[:VIDEO_HEIGHT, :VIDEO_WIDTH])
+                    .set_duration(clip_duration)
+                    .set_start(current_time)
+                )
+                kb_clips.append(static_clip)
+            except Exception as e2:
+                print(f"   ❌ Static fallback also failed: {e2}")
+
+        current_time += image_duration
+
+    if not kb_clips:
+        print("   ❌ No video clips could be created.")
+        return None
+
+    if verbose:
+        print(f"\n   🎞️  Compositing background clips...")
+
+    background = CompositeVideoClip(kb_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
+    background = background.set_duration(total_duration)
+
+    if verbose:
+        print(f"   💬 Building {len(caption_chunks)} caption overlays...")
+
+    caption_clips = _build_caption_clips(caption_chunks, total_duration)
+
+    if verbose:
+        print(f"   ✅ {len(caption_clips)} caption clips created")
+
+    # Final Composite
+    all_clips = [background] + caption_clips
+    final_video = CompositeVideoClip(all_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
+    
+    # ── Background Music Mixing ───────────────────────────────────────────────
+    final_audio = audio_clip
+    
+    if MUSIC_DIR.exists():
+        import random
+        music_files = list(MUSIC_DIR.glob("*.mp3")) + list(MUSIC_DIR.glob("*.wav"))
+        
+        if music_files:
+            music_path = random.choice(music_files)
+            if verbose:
+                print(f"   🎵 Adding background music: {music_path.name}")
+            
+            try:
+                bg_music = AudioFileClip(str(music_path))
+                
+                # Loop if music is shorter than video
+                if bg_music.duration < total_duration:
+                    bg_music = audio_loop(bg_music, duration=total_duration)
+                else:
+                    bg_music = bg_music.subclip(0, total_duration)
+                
+                # Lower volume (15%) and fade out at end
+                bg_music = bg_music.volumex(0.15)
+                bg_music = audio_fadeout(bg_music, 2.0)
+                
+                final_audio = CompositeAudioClip([audio_clip, bg_music])
+            except Exception as e:
+                print(f"   ⚠️  Failed to mix background music: {e}")
+
+    final_video = final_video.set_audio(final_audio)
+    final_video = final_video.set_duration(total_duration)
+
+    # Render to File
+    if verbose:
+        print(f"\n   🔄 Rendering final video to {output_path}...")
+        print(f"   ⏳ This may take 2-5 minutes depending on video length...")
+
+    render_start = time.time()
+    try:
+        final_video.write_videofile(
+            str(output_path),
+            fps=VIDEO_FPS,
+            codec="libx264",
+            audio_codec="aac",
+            audio_bitrate="192k",
+            ffmpeg_params=[
+                "-crf", "18",
+                "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ],
+            threads=4,
+            logger=None if not verbose else "bar",
+        )
+
+        render_elapsed = time.time() - render_start
+
+        if output_path.exists():
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            if verbose:
+                print(f"\n   ✅ Video rendered in {render_elapsed:.1f}s")
+                print(f"   📁 Output: {output_path} ({size_mb:.1f} MB)")
+                print(f"   📐 Specs: {VIDEO_WIDTH}×{VIDEO_HEIGHT}, {VIDEO_FPS}fps, {total_duration:.1f}s")
+            return output_path
+        else:
+            print("   ❌ Output file was not created.")
+            return None
+
+    except Exception as e:
+        print(f"   ❌ Video rendering failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    finally:
+        try:
+            audio_clip.close()
+            final_video.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    print("🎬 assembly.py — Testing with existing output files...")
+
+    missing = []
+    if not AUDIO_FILE.exists():
+        missing.append(str(AUDIO_FILE))
+    if not TIMESTAMPS_FILE.exists():
+        missing.append(str(TIMESTAMPS_FILE))
+
+    image_files = sorted(OUTPUT_DIR.glob("image_*.png")) if OUTPUT_DIR.exists() else []
+    if not image_files:
+        missing.append("output/image_*.png")
+
+    if missing:
+        print(f"❌ Missing required files: {', '.join(missing)}")
+        sys.exit(1)
+
+    with open(TIMESTAMPS_FILE, "r") as f:
+        chunks = json.load(f)
+
+    print(f"   Found {len(image_files)} images, {len(chunks)} caption chunks")
+
+    result = assemble_video(
+        image_paths=image_files,
+        audio_path=AUDIO_FILE,
+        caption_chunks=chunks,
+    )
+
+    if result:
+        print(f"\n✅ Video ready: {result}")
+    else:
+        print("❌ Assembly failed.")
+        sys.exit(1)
+
+
+### FILE: brain.py ###
+
+"""
+brain.py — Module 1: LLM Script Generation
+============================================
+Uses local Ollama (llama3.2:3b) to generate a structured JSON script
+for a documentary-style YouTube Short on Indian history/philosophy.
+
+Output JSON schema:
+{
+    "title": str,           # Click-worthy YouTube title
+    "narration": str,       # Full spoken script (~60 seconds)
+    "image_prompts": list   # 5-6 descriptive art prompts
+}
+"""
+
+import json
+import time
+import subprocess
+import sys
+import re
+from typing import Optional
+
+import ollama
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+OLLAMA_MODEL = "llama3.2:3b"
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
+# ── Art Style Suffix ──────────────────────────────────────────────────────────
+# Appended to every image prompt for consistent visual style
+ART_STYLE_SUFFIX = (
+    "Amar Chitra Katha comic book style, vibrant digital illustration, "
+    "bold black outlines, cel shaded, 2D animation, flat colors, "
+    "hindu mythology art, expressive characters, "
+    "no photorealism, no shading, no 3d render"
+)
+
+# ── System Prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a master storyteller of ancient Indian history and philosophy. You do not lecture; you transport the listener to the scene.
+
+Your task is to create a cinematic, emotionally resonant YouTube Short script.
+- **NO Academic Jargon:** Do not say "In Chapter X, Verse Y" or "The translation is".
+- **NO Bookish Tone:** Do not sound like you are reading a textbook.
+- **Storytelling First:** Start with a hook. Use active voice. Speak directly to the viewer ("You").
+- **Flow:** Use short, punchy sentences. Mix rhythm.
+- **Content:** If explaining a verse, weave the meaning naturally into the narrative.
+
+You MUST respond ONLY with a single valid JSON object. No preamble, no markdown code blocks, no explanation outside the JSON. The JSON must have exactly these three keys:
+
+1. "title": A click-worthy, curiosity-driven YouTube title (max 60 characters). Use power words. Example: "The Secret Krishna Revealed Only to Arjuna"
+
+2. "narration": The complete spoken script as a single string. Write it as a documentary narrator would speak — with gravitas, pauses implied by punctuation, and a sense of ancient wisdom being revealed.
+
+3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a cartoon-style ancient Indian illustration. Rules: \n   - DESCRIBE PIXELS, NOT CONCEPTS. Don't say "symbolizing peace", say "a man sitting under a tree".\n   - Keep it literal. \n   - Focus on characters and action.
+
+4. "scene_timing": An array of exactly 8 integers. Each value represents seconds each corresponding image_prompt should remain on screen.
+   - Array length must equal image_prompts length.
+   - Total duration must be between 55 and 60 seconds.
+   - First scene duration must be 2–3 seconds (fast hook).
+   - Middle scenes longer (teaching phase).
+   - Final scene 5–7 seconds to enable looping."""
+
+# ── Series Outline Prompt ─────────────────────────────────────────────────────
+OUTLINE_SYSTEM_PROMPT = """You are an expert documentary showrunner.
+Your task is to break down a broad topic into a compelling {num_parts}-part series.
+
+Return ONLY a JSON object with this structure:
+{{ "series_title": "Main Title", "parts": [ {{ "part_number": 1, "title": "Part Title", "summary": "Plot points to cover..." }}, ... ] }}
+"""
+
+# ── User Prompt Template ──────────────────────────────────────────────────────
+USER_PROMPT_TEMPLATE = """Create a 60-second YouTube Short documentary script about: "{topic}"
+
+Remember:
+- The narration must be 140-160 words
+- The image_prompts array must have exactly 8 elements
+- The scene_timing array must match image_prompts length
+- Each image prompt should visually represent a different segment of the narration
+- Respond ONLY with the JSON object, nothing else"""
+
+
+def _ensure_ollama_running() -> bool:
+    """Check if Ollama server is running; attempt to start it if not."""
+    try:
+        client = ollama.Client()
+        client.list()  # Simple ping
+        return True
+    except Exception:
+        print("   ⚠️  Ollama server not running. Attempting to start...")
+        try:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            time.sleep(4)  # Give it time to start
+            return True
+        except FileNotFoundError:
+            print("   ❌ ERROR: 'ollama' not found. Run setup.sh first.")
+            return False
+
+
+def _validate_script(data: dict) -> tuple[bool, str]:
+    """Validate the JSON structure returned by the LLM."""
+    required_keys = ["title", "narration", "image_prompts"]
+
+    for key in required_keys:
+        if key not in data:
+            return False, f"Missing required key: '{key}'"
+
+    if not isinstance(data["title"], str) or len(data["title"].strip()) == 0:
+        return False, "Field 'title' must be a non-empty string"
+
+    if not isinstance(data["narration"], str) or len(data["narration"].strip()) < 50:
+        return False, "Field 'narration' must be a string with at least 50 characters"
+
+    if not isinstance(data["image_prompts"], list):
+        return False, "Field 'image_prompts' must be an array"
+
+    if len(data["image_prompts"]) < 3:
+        return False, f"Field 'image_prompts' must have at least 3 items (got {len(data['image_prompts'])})"
+
+    if "scene_timing" in data:
+        if not isinstance(data["scene_timing"], list):
+            return False, "Field 'scene_timing' must be an array"
+        if not all(isinstance(x, (int, float)) for x in data["scene_timing"]):
+            return False, "Field 'scene_timing' must contain numbers"
+
+    return True, "OK"
+
+
+def enrich_image_prompts(prompts: list) -> list:
+    """Append the art style suffix to each image prompt."""
+    enriched = []
+    for prompt in prompts:
+        if ART_STYLE_SUFFIX.lower() not in prompt.lower():
+            enriched.append(f"{prompt.rstrip('. ')}, {ART_STYLE_SUFFIX}")
+        else:
+            enriched.append(prompt)
+    return enriched
+
+
+def generate_script(topic: str, previous_context: str = None, verbose: bool = True) -> Optional[dict]:
+    """
+    Generate a documentary script for the given topic using Ollama.
+
+    Args:
+        topic: The historical/philosophical topic (e.g., "Bhagavad Gita Chapter 2, Verse 47")
+        previous_context: Summary of the previous part (for series continuity)
+        verbose: Whether to print progress messages
+
+    Returns:
+        dict with keys: title, narration, image_prompts
+        None if generation fails after all retries
+    """
+    if verbose:
+        print(f"\n🧠 [brain.py] Generating script for: \"{topic}\"")
+        print(f"   Model: {OLLAMA_MODEL}")
+
+    # Ensure Ollama is running
+    if not _ensure_ollama_running():
+        return None
+
+    user_prompt = USER_PROMPT_TEMPLATE.format(topic=topic)
+    
+    if previous_context:
+        user_prompt += f"\n\nCONTEXT FROM PREVIOUS PART (CONTINUE THE STORY): {previous_context}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        if verbose:
+            print(f"   Attempt {attempt}/{MAX_RETRIES}...")
+
+        try:
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                format="json",
+                options={
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "num_predict": 1024,
+                }
+            )
+
+            raw_content = response["message"]["content"].strip()
+
+            # Strip markdown code fences if the model added them anyway
+            if raw_content.startswith("```"):
+                lines = raw_content.split("\n")
+                raw_content = "\n".join(
+                    line for line in lines
+                    if not line.strip().startswith("```")
+                )
+
+            # Parse JSON
+            data = json.loads(raw_content)
+
+            # Validate structure
+            is_valid, error_msg = _validate_script(data)
+            if not is_valid:
+                if verbose:
+                    print(f"   ⚠️  Invalid structure: {error_msg}. Retrying...")
+                time.sleep(RETRY_DELAY)
+                continue
+
+            # Enrich image prompts with art style
+            data["image_prompts"] = enrich_image_prompts(data["image_prompts"])
+
+            # Ensure we have exactly 8 prompts (pad or trim)
+            while len(data["image_prompts"]) < 8:
+                data["image_prompts"].append(
+                    f"Ancient Indian temple, comic book style, vibrant colors, "
+                    f"bold lines, {ART_STYLE_SUFFIX}"
+                )
+            data["image_prompts"] = data["image_prompts"][:8]
+
+            # Sync scene_timing if present
+            if "scene_timing" in data and isinstance(data["scene_timing"], list):
+                while len(data["scene_timing"]) < 8:
+                    data["scene_timing"].append(5)
+                data["scene_timing"] = data["scene_timing"][:8]
+
+            if verbose:
+                word_count = len(data["narration"].split())
+                print(f"   ✅ Script generated successfully!")
+                print(f"   📋 Title: {data['title']}")
+                print(f"   📝 Narration: {word_count} words")
+                print(f"   🎨 Image prompts: {len(data['image_prompts'])}")
+
+            return data
+
+        except json.JSONDecodeError as e:
+            if verbose:
+                print(f"   ⚠️  JSON parse error: {e}. Retrying...")
+            time.sleep(RETRY_DELAY)
+
+        except ollama.ResponseError as e:
+            if "model" in str(e).lower() and "not found" in str(e).lower():
+                print(f"\n   ❌ Model '{OLLAMA_MODEL}' not found.")
+                print(f"   Run: ollama pull {OLLAMA_MODEL}")
+                return None
+            if verbose:
+                print(f"   ⚠️  Ollama error: {e}. Retrying...")
+            time.sleep(RETRY_DELAY)
+
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️  Unexpected error: {e}. Retrying...")
+            time.sleep(RETRY_DELAY)
+
+    print(f"\n   ❌ Failed to generate script after {MAX_RETRIES} attempts.")
+    return None
+
+
+def generate_series_outline(topic: str, num_parts: int, verbose: bool = True) -> Optional[dict]:
+    """Generate a structured outline for a multi-part series."""
+    if verbose:
+        print(f"\n🧠 [brain.py] Generating outline for {num_parts}-part series: \"{topic}\"")
+
+    if not _ensure_ollama_running():
+        return None
+
+    system_prompt = OUTLINE_SYSTEM_PROMPT.format(num_parts=num_parts)
+    user_prompt = f"Create a {num_parts}-part outline for: {topic}"
+
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            format="json",
+            options={"temperature": 0.7}
+        )
+        
+        raw_content = response["message"]["content"].strip()
+        
+        # Clean up potential markdown
+        if raw_content.startswith("```"):
+            lines = raw_content.split("\n")
+            raw_content = "\n".join(line for line in lines if not line.strip().startswith("```"))
+
+        data = json.loads(raw_content)
+        
+        if "parts" not in data or not isinstance(data["parts"], list):
+            print("   ❌ Invalid outline format received.")
+            return None
+            
+        if verbose:
+            print(f"   ✅ Outline generated: {len(data['parts'])} parts")
+            
+        return data
+
+    except Exception as e:
+        print(f"   ❌ Failed to generate outline: {e}")
+        return None
+
+
+# ── CLI Entry Point ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python brain.py \"<topic>\"")
+        print("Example: python brain.py \"Bhagavad Gita Chapter 2, Verse 47\"")
+        sys.exit(1)
+
+    topic = " ".join(sys.argv[1:])
+    result = generate_script(topic)
+
+    if result:
+        print("\n" + "─" * 60)
+        print("GENERATED SCRIPT (JSON):")
+        print("─" * 60)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        sys.exit(1)
+
+
+### FILE: main.py ###
+
+#!/usr/bin/env python3
+"""
+main.py — YouTube Shorts Pipeline Orchestrator
+===============================================
+Ties all modules together into a single command:
+
+    python main.py "Bhagavad Gita Chapter 2, Verse 47"
+
+Modules invoked (in order):
+  1. brain.py   → Script generation (Ollama/Llama 3)
+  2. voice.py   → Audio + word timestamps (edge-tts + mlx-whisper)
+  3. vision.py  → Image generation (Draw Things API)
+  4. assembly.py → Final video assembly (moviepy)
+
+Flags:
+  --no-images   : Skip image generation, use colored placeholders
+  --no-video    : Skip video rendering (stop after audio/images)
+  -v, --verbose : Print detailed progress
+  -h, --help    : Show this help message
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Add current directory to path so we can import the modules
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import pipeline modules
+import brain
+import voice
+import vision
+import assembly
+
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+OUTPUT_DIR = Path("output")
+ASSETS_DIR = Path("assets/music")
+
+def get_project_dir(topic: str) -> Path:
+    """Create a sanitized directory name based on the topic."""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Remove non-alphanumeric characters (except spaces and hyphens)
+    safe_name = re.sub(r'[^\w\s-]', '', topic).strip()
+    # Replace spaces with underscores
+    safe_name = re.sub(r'[-\s]+', '_', safe_name)
+    return OUTPUT_DIR / f"{timestamp}_{safe_name}"
+
+
+# ── CLI Argument Parser ───────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate a documentary-style YouTube Short on Indian history/philosophy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py "Bhagavad Gita Chapter 2, Verse 47"
+  python main.py "The rise of Ravana"
+  python main.py --no-images "Krishna's flute"    # Uses placeholder images
+  
+Required external services:
+  • Ollama (llama3.2:3b)     - Run: ollama serve
+  • Draw Things (port 7888)  - Enable: Settings → API Server → HTTP API
+  • FFmpeg                   - Installed via setup.sh
+        """
+    )
+
+    parser.add_argument(
+        "topic",
+        nargs="?",
+        default="Bhagavad Gita Chapter 2, Verse 47",
+        help="The historical/philosophical topic for the video (default: %(default)s)"
+    )
+
+    parser.add_argument(
+        "--no-images",
+        action="store_true",
+        help="Skip Draw Things image generation, use colored placeholders instead"
+    )
+
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Stop after generating script + audio + images (skip final video render)"
+    )
+
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print detailed progress messages"
+    )
+
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Pause after script generation to allow manual editing of the JSON file"
+    )
+
+    parser.add_argument(
+        "--script-file",
+        type=Path,
+        help="Path to an existing JSON script file (skips AI generation step)"
+    )
+
+    return parser.parse_args()
+
+
+# ── Pipeline Stage 1: Script Generation ───────────────────────────────────────
+
+def stage_1_generate_script(topic: str, project_dir: Path, context: str, verbose: bool) -> dict | None:
+    """Generate the documentary script using Ollama."""
+    print("\n" + "═" * 70)
+    print("  STAGE 1: Script Generation")
+    print("═" * 70)
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+    result = brain.generate_script(topic, previous_context=context, verbose=verbose)
+
+    if result is None:
+        print("\n❌ FAILED: Script generation failed.")
+        return None
+
+    # Save script to JSON for reference
+    script_file = project_dir / "script.json"
+    with open(script_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    print(f"\n✅ Script saved to: {script_file}")
+    return result
+
+
+# ── Pipeline Stage 2: Voiceover + Timestamps ─────────────────────────────────
+
+def stage_2_generate_voice(narration: str, project_dir: Path, verbose: bool) -> tuple[Path | None, list | None]:
+    """Generate TTS audio and extract word-level timestamps."""
+    print("\n" + "═" * 70)
+    print("  STAGE 2: Voiceover + Timestamps")
+    print("═" * 70)
+
+    audio_path, caption_chunks = voice.process_voice(narration, output_dir=project_dir, verbose=verbose)
+
+    if audio_path is None or caption_chunks is None:
+        print("\n❌ FAILED: Voice processing failed.")
+        return None, None
+
+    print(f"\n✅ Voice pipeline complete.")
+    print(f"   Audio: {audio_path}")
+    print(f"   Captions: {len(caption_chunks)} chunks")
+    return audio_path, caption_chunks
+
+
+# ── Pipeline Stage 3: Image Generation ─────────────────────────────────────────
+
+def stage_3_generate_images(image_prompts: list, project_dir: Path, use_placeholders: bool, verbose: bool) -> list[Path]:
+    """Generate images from prompts (or use placeholders)."""
+    print("\n" + "═" * 70)
+    print("  STAGE 3: Image Generation")
+    print("═" * 70)
+
+    if use_placeholders:
+        print("\n⚠️  --no-images flag detected: Using placeholder images.")
+        image_paths = vision.generate_placeholder_images(
+            count=len(image_prompts),
+            output_dir=project_dir,
+            verbose=verbose
+        )
+    else:
+        image_paths = vision.generate_images(image_prompts, output_dir=project_dir, verbose=verbose)
+
+    if not image_paths:
+        print("\n❌ FAILED: No images could be generated.")
+        print("   Try running with --no-images to use placeholders.")
+        return []
+
+    print(f"\n✅ Image generation complete: {len(image_paths)} images")
+    return image_paths
+
+
+# ── Pipeline Stage 4: Video Assembly ───────────────────────────────────────────
+
+def stage_4_assemble_video(
+    image_paths: list,
+    audio_path: Path,
+    caption_chunks: list,
+    project_dir: Path,
+    verbose: bool
+) -> Path | None:
+    """Assemble the final video with Ken Burns effect and captions."""
+    print("\n" + "═" * 70)
+    print("  STAGE 4: Video Assembly")
+    print("═" * 70)
+
+    output_video_path = project_dir / "final_video.mp4"
+
+    output_path = assembly.assemble_video(
+        image_paths=image_paths,
+        audio_path=audio_path,
+        caption_chunks=caption_chunks,
+        output_path=output_video_path,
+        verbose=verbose
+    )
+
+    if output_path is None:
+        print("\n❌ FAILED: Video assembly failed.")
+        return None
+
+    return output_path
+
+
+# ── Main Pipeline ─────────────────────────────────────────────────────────────
+
+def run_pipeline(
+    topic: str,
+    use_placeholders: bool = False,
+    skip_video: bool = False,
+    verbose: bool = True,
+    script_context: str = None,
+    custom_output_dir: Path = None,
+    review_mode: bool = False,
+    script_file: Path = None
+) -> bool:
+    """
+    Execute the full video generation pipeline.
+
+    Returns:
+        True if pipeline completed successfully, False otherwise
+    """
+    overall_start = time.time()
+
+    if custom_output_dir:
+        project_dir = custom_output_dir
+    else:
+        project_dir = get_project_dir(topic)
+
+    # Ensure assets directory exists
+    if not ASSETS_DIR.exists():
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Welcome banner
+    print("")
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " " * 15 + "🎬 YouTube Shorts Pipeline" + " " * 26 + "║")
+    print("║" + " " * 12 + "Indian History & Philosophy Generator" + " " * 17 + "║")
+    print("╚" + "═" * 68 + "╝")
+    print("")
+    print(f"📝 Topic: \"{topic}\"")
+    print(f"🔧 Mode:  {'Placeholder images' if use_placeholders else 'AI-generated images'}")
+    print(f"📦 Output: {project_dir.absolute()}")
+    
+    # Check for music
+    music_count = len(list(ASSETS_DIR.glob("*.mp3"))) + len(list(ASSETS_DIR.glob("*.wav")))
+    print(f"🎵 Music:  {music_count} tracks found in {ASSETS_DIR}")
+    print("")
+
+    # ── Stage 1: Script ───────────────────────────────────────────────────────
+    if script_file:
+        print("\n" + "═" * 70)
+        print("  STAGE 1: Script Loading (Manual Input)")
+        print("═" * 70)
+        
+        project_dir.mkdir(parents=True, exist_ok=True)
+        target_script = project_dir / "script.json"
+        
+        try:
+            shutil.copy(script_file, target_script)
+            with open(target_script, "r", encoding="utf-8") as f:
+                script = json.load(f)
+            
+            # Automatically apply the cartoon art style to manual scripts
+            if "image_prompts" in script:
+                script["image_prompts"] = brain.enrich_image_prompts(script["image_prompts"])
+                
+            print(f"✅ Loaded manual script from: {script_file}")
+        except Exception as e:
+            print(f"❌ Failed to load script file: {e}")
+            return False
+    else:
+        script = stage_1_generate_script(topic, project_dir, script_context, verbose)
+    
+    if script is None:
+        return False
+
+    # ── Review Mode Pause ─────────────────────────────────────────────────────
+    if review_mode:
+        print("\n" + "─" * 70)
+        print("  ⏸️  REVIEW MODE: Pipeline paused for manual editing.")
+        print("" + "─" * 70)
+        print(f"  The script is saved at: {project_dir / 'script.json'}")
+        print("  1. Open this file in your text editor.")
+        print("  2. Fix any hallucinations in 'narration'.")
+        print("  3. Adjust 'image_prompts' if needed.")
+        print("  4. Save the file.")
+        input("\n  Press [Enter] to reload the script and continue...")
+        
+        try:
+            with open(project_dir / "script.json", "r", encoding="utf-8") as f:
+                script = json.load(f)
+            print("  ✅ Script reloaded with your changes.")
+        except Exception as e:
+            print(f"  ❌ Failed to reload script: {e}")
+            return False
+
+    title = script.get("title", "Untitled")
+    narration = script["narration"]
+    image_prompts = script["image_prompts"]
+
+    print(f"\n📋 Generated Title: {title}")
+    print(f"📝 Narration: {len(narration.split())} words")
+    print(f"🖼️  Image Prompts: {len(image_prompts)}")
+
+    # ── Stage 2: Voice ─────────────────────────────────────────────────────────
+    audio_path, caption_chunks = stage_2_generate_voice(narration, project_dir, verbose)
+    if audio_path is None or caption_chunks is None:
+        return False
+
+    # ── Stage 3: Images ─────────────────────────────────────────────────────────
+    image_paths = stage_3_generate_images(image_prompts, project_dir, use_placeholders, verbose)
+    if not image_paths:
+        return False
+
+    # ── Stage 4: Video ─────────────────────────────────────────────────────────
+    if skip_video:
+        print("\n" + "═" * 70)
+        print("  SKIPPED: Video Assembly (--no-video flag)")
+        print("═" * 70)
+        print("\n✅ Pipeline stopped after Stage 3.")
+        print(f"   Audio:   {audio_path}")
+        print(f"   Images: {len(image_paths)} files in {project_dir}")
+        print(f"   Script: {project_dir / 'script.json'}")
+        return True
+
+    final_video = stage_4_assemble_video(image_paths, audio_path, caption_chunks, project_dir, verbose)
+    if final_video is None:
+        return False
+
+    # ── Success Summary ────────────────────────────────────────────────────────
+    elapsed = time.time() - overall_start
+    minutes = int(elapsed // 60)
+    seconds = int(elapsed % 60)
+
+    print("\n" + "═" * 70)
+    print("  ✅ PIPELINE COMPLETE!")
+    print("═" * 70)
+    print("")
+    print(f"   🎬 Final Video: {final_video}")
+    print(f"   📐 Resolution:  1080×1920 (9:16 vertical)")
+    print(f"   ⏱️  Duration:   ~{minutes}m {seconds}s total")
+    print("")
+    print("   📁 All output files:")
+    print(f"      • {project_dir / 'final_video.mp4'}")
+    print(f"      • {project_dir / 'narration.mp3'}")
+    print(f"      • {project_dir / 'timestamps.json'}")
+    print(f"      • {project_dir / 'script.json'}")
+    for i, img in enumerate(sorted(project_dir.glob("image_*.png"))):
+        print(f"      • {img.name}")
+    print("")
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " " * 20 + "🎉 Ready for Upload!" + " " * 27 + "║")
+    print("╚" + "═" * 68 + "╝")
+    print("")
+
+    return True
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    success = run_pipeline(
+        topic=args.topic,
+        use_placeholders=args.no_images,
+        skip_video=args.no_video,
+        verbose=args.verbose,
+        review_mode=args.review,
+        script_file=args.script_file
+    )
+
+    sys.exit(0 if success else 1)
+
+
+### FILE: vision.py ###
+
+"""
+vision.py — Module 3: Image Generation via Draw Things HTTP API
+================================================================
+Sends image prompts to the Draw Things app running locally on port 7888.
+Draw Things must be running with its HTTP API server enabled.
+
+How to enable Draw Things API:
+  1. Open Draw Things app
+  2. Go to Settings → API Server
+  3. Enable "HTTP API Server" on port 7888
+
+Output files:
+    output/image_0.png ... output/image_N.png
+
+Draw Things API Reference:
+  POST http://localhost:7888/sdapi/v1/txt2img
+  Body: { "prompt": str, "width": int, "height": int, ... }
+  Response: { "images": [base64_string, ...] }
+"""
+
+import base64
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+from PIL import Image
+import io
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+DRAW_THINGS_URL = "http://localhost:7888"
+TXT2IMG_ENDPOINT = f"{DRAW_THINGS_URL}/sdapi/v1/txt2img"
+
+# Output canvas: 1080×1920 (9:16 vertical for YouTube Shorts)
+# Draw Things generates square images; we'll crop/pad in assembly.py
+# Requesting portrait directly for best results
+IMAGE_WIDTH = 768
+IMAGE_HEIGHT = 1344   # ~9:16 ratio at 768 width
+
+OUTPUT_DIR = Path("output")
+
+# ── Default Generation Parameters ─────────────────────────────────────────────
+# ── Default Generation Parameters Optimized for FLUX.1 [schnell] ─────────────
+# Updated for M4 Air Heat Management
+DEFAULT_PARAMS = {
+    "width": IMAGE_WIDTH,            # 768px (Higher quality)
+    "height": IMAGE_HEIGHT,          # 1344px (Sharper source for 1080p video)
+    "steps": 4,                      # Absolute minimum steps for Flux
+    "cfg_scale": 1.0,
+    "sampler_name": "Euler A Trailing",
+    "shift": 3.17,
+    "n_iter": 1,
+    "batch_size": 1,
+}
+# Also, change the timeout to give your Mac more room
+API_TIMEOUT = 600 # Increases to 10 minutes
+
+
+# ── API Health Check ──────────────────────────────────────────────────────────
+
+def check_draw_things_running(verbose: bool = True) -> bool:
+    """
+    Check if Draw Things HTTP API is accessible.
+    """
+    try:
+        # We try the base URL since we know it returns a valid JSON response on your Mac
+        response = requests.get(DRAW_THINGS_URL, timeout=5)
+        if response.status_code == 200:
+            if verbose:
+                print(f"   ✅ Draw Things API is running at {DRAW_THINGS_URL}")
+            return True
+        return False
+    except Exception:
+        if verbose:
+            print(f"   ❌ Cannot connect to Draw Things at {DRAW_THINGS_URL}")
+        return False
+# ── Single Image Generation ───────────────────────────────────────────────────
+
+def generate_single_image(
+    prompt: str,
+    output_path: Path,
+    seed: int = -1,
+    verbose: bool = True
+) -> Optional[Path]:
+    """
+    Generate a single image via Draw Things API.
+
+    Args:
+        prompt: The image generation prompt
+        output_path: Where to save the PNG file
+        seed: Random seed (-1 for random)
+        verbose: Whether to print progress
+
+    Returns:
+        Path to saved image, or None on failure
+    """
+    payload = {
+        **DEFAULT_PARAMS,
+        "prompt": prompt,
+        "seed": seed,
+    }
+
+    try:
+        if verbose:
+            # Show truncated prompt
+            short_prompt = prompt[:80] + "..." if len(prompt) > 80 else prompt
+            print(f"   🎨 Generating: \"{short_prompt}\"")
+
+        start_time = time.time()
+        response = requests.post(
+            TXT2IMG_ENDPOINT,
+            json=payload,
+            timeout=API_TIMEOUT
+        )
+        elapsed = time.time() - start_time
+
+        if response.status_code != 200:
+            print(f"   ❌ API error {response.status_code}: {response.text[:200]}")
+            return None
+
+        data = response.json()
+
+        # Extract base64 image
+        images = data.get("images", [])
+        if not images:
+            print(f"   ❌ No images in API response")
+            return None
+
+        # Decode and save
+        img_data = base64.b64decode(images[0])
+        img = Image.open(io.BytesIO(img_data))
+
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save as PNG
+        img.save(str(output_path), "PNG")
+
+        if verbose:
+            w, h = img.size
+            print(f"   ✅ Saved: {output_path} ({w}×{h}, {elapsed:.1f}s)")
+
+        return output_path
+
+    except requests.exceptions.Timeout:
+        print(f"   ❌ Request timed out after {API_TIMEOUT}s")
+        return None
+    except requests.exceptions.ConnectionError:
+        print(f"   ❌ Lost connection to Draw Things API")
+        return None
+    except Exception as e:
+        print(f"   ❌ Image generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# ── Batch Image Generation ────────────────────────────────────────────────────
+
+def generate_images(
+    image_prompts: list,
+    output_dir: Path = OUTPUT_DIR,
+    verbose: bool = True
+) -> list[Path]:
+    """
+    Generate all images for the video from a list of prompts.
+
+    Args:
+        image_prompts: List of prompt strings (5-6 items)
+        output_dir: Directory to save images in
+        verbose: Whether to print progress
+
+    Returns:
+        List of Paths to generated images (may be shorter than input if some fail)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"\n🖼️  [vision.py] Generating {len(image_prompts)} images via Draw Things...")
+        print(f"   Resolution: {IMAGE_WIDTH}×{IMAGE_HEIGHT} (portrait 9:16)")
+        print(f"   API: {DRAW_THINGS_URL}")
+
+    # Check API availability
+    if not check_draw_things_running(verbose=verbose):
+        print("\n   ❌ Draw Things is not running. Cannot generate images.")
+        print("   ℹ️  Tip: You can still test the pipeline with placeholder images.")
+        print("   ℹ️  Run: python main.py --no-images \"<topic>\"")
+        return []
+
+    generated_paths = []
+
+    for i, prompt in enumerate(image_prompts):
+        output_path = output_dir / f"image_{i}.png"
+
+        if verbose:
+            print(f"\n   [{i+1}/{len(image_prompts)}] Image {i+1}:")
+
+        path = generate_single_image(
+            prompt=prompt,
+            output_path=output_path,
+            seed=-1,  # Random seed for variety
+            verbose=verbose
+        )
+
+        if path:
+            generated_paths.append(path)
+        else:
+            print(f"   ⚠️  Skipping image {i+1} due to generation failure")
+
+    if verbose:
+        print(f"\n   📊 Generated {len(generated_paths)}/{len(image_prompts)} images successfully")
+
+    return generated_paths
+
+
+# ── Placeholder Image Generator (for --no-images mode) ───────────────────────
+
+def generate_placeholder_images(count: int = 5, output_dir: Path = OUTPUT_DIR, verbose: bool = True) -> list[Path]:
+    """
+    Generate simple gradient placeholder images for testing without Draw Things.
+    Creates visually distinct colored gradient images at full resolution.
+
+    Args:
+        count: Number of placeholder images to create
+        output_dir: Directory to save images in
+        verbose: Whether to print progress
+
+    Returns:
+        List of Paths to placeholder images
+    """
+    import numpy as np
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"\n🖼️  [vision.py] Generating {count} placeholder images (no Draw Things)...")
+
+    # Rich color palettes inspired by Indian art
+    color_schemes = [
+        ((139, 69, 19), (255, 215, 0)),    # Saffron/Gold — sacred fire
+        ((25, 25, 112), (138, 43, 226)),    # Midnight blue/Purple — cosmic
+        ((0, 100, 0), (255, 165, 0)),       # Forest green/Orange — nature
+        ((128, 0, 0), (255, 215, 0)),       # Deep red/Gold — royalty
+        ((0, 0, 139), (135, 206, 235)),     # Deep blue/Sky — divine
+    ]
+
+    paths = []
+    for i in range(count):
+        output_path = output_dir / f"image_{i}.png"
+        color1, color2 = color_schemes[i % len(color_schemes)]
+
+        # Create gradient image
+        img_array = np.zeros((IMAGE_HEIGHT, IMAGE_WIDTH, 3), dtype=np.uint8)
+        for y in range(IMAGE_HEIGHT):
+            t = y / IMAGE_HEIGHT
+            r = int(color1[0] * (1 - t) + color2[0] * t)
+            g = int(color1[1] * (1 - t) + color2[1] * t)
+            b = int(color1[2] * (1 - t) + color2[2] * t)
+            img_array[y, :] = [r, g, b]
+
+        img = Image.fromarray(img_array)
+        img.save(str(output_path), "PNG")
+        paths.append(output_path)
+
+        if verbose:
+            print(f"   ✅ Placeholder {i+1}: {output_path}")
+
+    return paths
+
+
+# ── CLI Entry Point ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    test_prompts = [
+        (
+            "Lord Krishna standing on the battlefield of Kurukshetra, holding a divine conch shell, "
+            "golden divine aura surrounding him, Arjuna kneeling before him in despair, "
+            "thousands of warriors in the background, dramatic sunset sky with orange and purple clouds, "
+            "epic oil painting, ancient Indian art style, dramatic golden hour lighting, "
+            "Mughal miniature meets photorealism, rich jewel tones, cinematic composition, "
+            "8K resolution, hyper-detailed, no text, no watermarks"
+        ),
+        (
+            "Ancient Sanskrit manuscript open on a stone altar, glowing golden text, "
+            "lotus flowers surrounding it, soft divine light rays from above, "
+            "ancient Indian temple interior, incense smoke, peaceful atmosphere, "
+            "epic oil painting, ancient Indian art style, dramatic golden hour lighting, "
+            "8K resolution, hyper-detailed"
+        ),
+    ]
+
+    if "--placeholder" in sys.argv:
+        paths = generate_placeholder_images(count=5)
+    else:
+        paths = generate_images(test_prompts)
+
+    if paths:
+        print(f"\n✅ Generated {len(paths)} images:")
+        for p in paths:
+            print(f"   {p}")
+    else:
+        print("❌ No images generated.")
+        sys.exit(1)
+
+
+### FILE: voice.py ###
+
+"""
+voice.py — Module 2: Text-to-Speech + Word Timestamps
+=======================================================
+Phase A: Generates narration audio using Microsoft Edge TTS
+Phase B: Transcribes the audio with mlx-whisper to get word-level timestamps
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import edge_tts
+import mlx_whisper
+
+# Configuration
+WHISPER_MODEL = "mlx-community/whisper-base-mlx"
+OUTPUT_DIR = Path("output")
+AUDIO_FILE = OUTPUT_DIR / "narration.mp3"
+TIMESTAMPS_FILE = OUTPUT_DIR / "timestamps.json"
+WORDS_PER_CHUNK = 4
+
+# --- UPDATED VOICE SETTINGS ---
+# Prabhat is more grounded/authoritative for Bhagavad Gita narration
+EDGE_VOICE = "en-IN-PrabhatNeural" 
+EDGE_RATE = "+5%"  # Slightly faster for engaging storytelling flow
+
+# Fallback Voice settings (macOS built-in)
+MACOS_VOICE = "Rishi"
+
+
+async def _generate_edge_audio(text: str, output_path: Path) -> bool:
+    """Generate audio using Microsoft Edge TTS with improved error catching."""
+    try:
+        communicate = edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE)
+        await communicate.save(str(output_path))
+        return output_path.exists() and output_path.stat().st_size > 0
+    except Exception as e:
+        # Catching the 403 Forbidden specifically
+        if "403" in str(e):
+            print(f"      ❌ Edge TTS 403 Forbidden: Microsoft blocked the request.")
+        else:
+            print(f"      Edge TTS error: {e}")
+        return False
+
+
+def _generate_macos_audio(text: str, output_path: Path) -> bool:
+    """Fallback: Generate audio using macOS 'say' command."""
+    try:
+        temp_aiff = output_path.with_suffix(".aiff")
+        
+        # 1. Generate AIFF using 'say'
+        try:
+            # Using -r (rate) to match the slower speed for the fallback as well
+            cmd = ["say", "-v", MACOS_VOICE, "-r", "150", "-o", str(temp_aiff), text]
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            print(f"      Voice '{MACOS_VOICE}' not found, using system default.")
+            cmd = ["say", "-o", str(temp_aiff), text]
+            subprocess.run(cmd, check=True, capture_output=True)
+        
+        # 2. Convert to MP3 using ffmpeg
+        cmd_convert = [
+            "ffmpeg", "-y", "-i", str(temp_aiff),
+            "-acodec", "libmp3lame", "-q:a", "2",
+            str(output_path)
+        ]
+        subprocess.run(cmd_convert, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if temp_aiff.exists():
+            temp_aiff.unlink()
+            
+        return output_path.exists() and output_path.stat().st_size > 0
+    except Exception as e:
+        print(f"      macOS fallback error: {e}")
+        return False
+
+
+def generate_audio(narration: str, output_path: Path = AUDIO_FILE, verbose: bool = True) -> Optional[Path]:
+    """Convert narration text to speech using Edge TTS (with macOS fallback)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"\n🎙️  [voice.py] Generating TTS audio...")
+        print(f"   Using: {EDGE_VOICE} at {EDGE_RATE} rate")
+
+    # Run async generation
+    success = False
+    try:
+        # Use a new event loop to avoid issues with existing ones
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(_generate_edge_audio(narration, output_path))
+        loop.close()
+    except Exception as e:
+        print(f"   ❌ Async execution failed: {e}")
+
+    if success:
+        size_kb = output_path.stat().st_size / 1024
+        if verbose:
+            print(f"   ✅ Audio saved: {output_path} ({size_kb:.1f} KB)")
+        return output_path
+    
+    # Fallback to macOS 'say'
+    if verbose:
+        print(f"   ⚠️  Edge TTS failed. Falling back to macOS: {MACOS_VOICE}")
+    
+    if _generate_macos_audio(narration, output_path):
+        size_kb = output_path.stat().st_size / 1024
+        if verbose:
+            print(f"   ✅ Audio saved (Fallback): {output_path} ({size_kb:.1f} KB)")
+        return output_path
+
+    print("   ❌ TTS generation failed (both Edge and macOS)")
+    return None
+
+# ... [Rest of your timestamp and process_voice functions remain the same] ...
+
+def _group_words_into_chunks(words: list, chunk_size: int = WORDS_PER_CHUNK) -> list:
+    """Group word-level timestamps into caption chunks."""
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        group = words[i:i + chunk_size]
+        if not group:
+            continue
+        chunk_text = " ".join(w["word"].strip() for w in group)
+        chunks.append({
+            "text": chunk_text,
+            "start": round(group[0]["start"], 3),
+            "end": round(group[-1]["end"], 3)
+        })
+    return chunks
+
+def generate_timestamps(audio_path: Path, output_path: Path = TIMESTAMPS_FILE, verbose: bool = True) -> Optional[list]:
+    """Transcribe audio with mlx-whisper to extract word-level timestamps."""
+    if verbose:
+        print(f"\n⏱️  [voice.py] Extracting word timestamps...")
+
+    try:
+        start_time = time.time()
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=WHISPER_MODEL,
+            word_timestamps=True,
+            language="en",
+            verbose=False,
+        )
+        elapsed = time.time() - start_time
+
+        all_words = []
+        for segment in result.get("segments", []):
+            for word_data in segment.get("words", []):
+                word = word_data.get("word", "").strip()
+                if word:
+                    all_words.append({
+                        "word": word,
+                        "start": word_data.get("start", 0.0),
+                        "end": word_data.get("end", 0.0),
+                    })
+
+        chunks = _group_words_into_chunks(all_words, WORDS_PER_CHUNK)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, indent=2)
+
+        if verbose:
+            print(f"   ✅ Timestamps: {len(all_words)} words → {len(chunks)} chunks ({elapsed:.1f}s)")
+        return chunks
+    except Exception as e:
+        print(f"   ❌ Whisper failed: {e}")
+        return None
+
+def process_voice(narration: str, output_dir: Path = OUTPUT_DIR, verbose: bool = True) -> tuple[Optional[Path], Optional[list]]:
+    """Full voice pipeline: TTS → Audio → Timestamps."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = generate_audio(narration, output_path=output_dir / "narration.mp3", verbose=verbose)
+    if audio_path is None:
+        return None, None
+    chunks = generate_timestamps(audio_path, output_path=output_dir / "timestamps.json", verbose=verbose)
+    return audio_path, chunks
+
+if __name__ == "__main__":
+    test_narration = (
+        "In the battlefield of Kurukshetra, as Arjuna's bow slipped from his hands, "
+        "Krishna spoke words that would echo through eternity."
+    )
+    process_voice(test_narration)
+
