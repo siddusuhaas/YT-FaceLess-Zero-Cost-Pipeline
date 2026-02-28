@@ -29,9 +29,10 @@ RETRY_DELAY = 2  # seconds
 # ── Art Style Suffix ──────────────────────────────────────────────────────────
 # Appended to every image prompt for consistent visual style
 ART_STYLE_SUFFIX = (
-    "epic oil painting, ancient Indian art style, dramatic golden hour lighting, "
-    "Mughal miniature meets photorealism, rich jewel tones, cinematic composition, "
-    "8K resolution, hyper-detailed, no text, no watermarks, no modern elements"
+    "Amar Chitra Katha comic book style, vibrant digital illustration, "
+    "bold black outlines, cel shaded, 2D animation, flat colors, "
+    "hindu mythology art, expressive characters, "
+    "no photorealism, no shading, no 3d render"
 )
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
@@ -50,7 +51,14 @@ You MUST respond ONLY with a single valid JSON object. No preamble, no markdown 
 
 2. "narration": The complete spoken script as a single string. Write it as a documentary narrator would speak — with gravitas, pauses implied by punctuation, and a sense of ancient wisdom being revealed.
 
-3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a majestic, realistic ancient Indian artwork image. Each prompt must describe: the scene, the characters (if any), the mood, the lighting, and the setting. Make them cinematic and specific."""
+3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a cartoon-style ancient Indian illustration. Rules: \n   - DESCRIBE PIXELS, NOT CONCEPTS. Don't say "symbolizing peace", say "a man sitting under a tree".\n   - Keep it literal. \n   - Focus on characters and action.
+
+4. "scene_timing": An array of exactly 8 integers. Each value represents seconds each corresponding image_prompt should remain on screen.
+   - Array length must equal image_prompts length.
+   - Total duration must be between 55 and 60 seconds.
+   - First scene duration must be 2–3 seconds (fast hook).
+   - Middle scenes longer (teaching phase).
+   - Final scene 5–7 seconds to enable looping."""
 
 # ── Series Outline Prompt ─────────────────────────────────────────────────────
 OUTLINE_SYSTEM_PROMPT = """You are an expert documentary showrunner.
@@ -66,6 +74,7 @@ USER_PROMPT_TEMPLATE = """Create a 60-second YouTube Short documentary script ab
 Remember:
 - The narration must be 140-160 words
 - The image_prompts array must have exactly 8 elements
+- The scene_timing array must match image_prompts length
 - Each image prompt should visually represent a different segment of the narration
 - Respond ONLY with the JSON object, nothing else"""
 
@@ -111,10 +120,16 @@ def _validate_script(data: dict) -> tuple[bool, str]:
     if len(data["image_prompts"]) < 3:
         return False, f"Field 'image_prompts' must have at least 3 items (got {len(data['image_prompts'])})"
 
+    if "scene_timing" in data:
+        if not isinstance(data["scene_timing"], list):
+            return False, "Field 'scene_timing' must be an array"
+        if not all(isinstance(x, (int, float)) for x in data["scene_timing"]):
+            return False, "Field 'scene_timing' must contain numbers"
+
     return True, "OK"
 
 
-def _enrich_image_prompts(prompts: list) -> list:
+def enrich_image_prompts(prompts: list) -> list:
     """Append the art style suffix to each image prompt."""
     enriched = []
     for prompt in prompts:
@@ -192,15 +207,21 @@ def generate_script(topic: str, previous_context: str = None, verbose: bool = Tr
                 continue
 
             # Enrich image prompts with art style
-            data["image_prompts"] = _enrich_image_prompts(data["image_prompts"])
+            data["image_prompts"] = enrich_image_prompts(data["image_prompts"])
 
             # Ensure we have exactly 8 prompts (pad or trim)
             while len(data["image_prompts"]) < 8:
                 data["image_prompts"].append(
-                    f"Ancient Indian temple at golden hour, dramatic atmosphere, "
-                    f"sacred geometry, divine light rays, {ART_STYLE_SUFFIX}"
+                    f"Ancient Indian temple, comic book style, vibrant colors, "
+                    f"bold lines, {ART_STYLE_SUFFIX}"
                 )
             data["image_prompts"] = data["image_prompts"][:8]
+
+            # Sync scene_timing if present
+            if "scene_timing" in data and isinstance(data["scene_timing"], list):
+                while len(data["scene_timing"]) < 8:
+                    data["scene_timing"].append(5)
+                data["scene_timing"] = data["scene_timing"][:8]
 
             if verbose:
                 word_count = len(data["narration"].split())

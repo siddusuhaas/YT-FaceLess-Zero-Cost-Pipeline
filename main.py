@@ -272,6 +272,11 @@ def run_pipeline(
             shutil.copy(script_file, target_script)
             with open(target_script, "r", encoding="utf-8") as f:
                 script = json.load(f)
+            
+            # Automatically apply the cartoon art style to manual scripts
+            if "image_prompts" in script:
+                script["image_prompts"] = brain.enrich_image_prompts(script["image_prompts"])
+                
             print(f"✅ Loaded manual script from: {script_file}")
         except Exception as e:
             print(f"❌ Failed to load script file: {e}")

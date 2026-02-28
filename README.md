@@ -307,7 +307,7 @@ OLLAMA_MODEL = "llama3.2:3b"  # Or use "llama3.1:8b" for better quality
 
 Edit `voice.py`:
 ```python
-TTS_VOICE = "en-IN-NeerjaNeural"  # Options: en-US-Jenny, en-GB-Sonia, etc.
+EDGE_VOICE = "en-IN-PrabhatNeural"  # Options: en-US-Jenny, en-GB-Sonia, etc.
 ```
 
 ### Change Video Resolution
