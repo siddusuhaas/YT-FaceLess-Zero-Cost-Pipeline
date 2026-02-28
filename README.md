@@ -30,6 +30,7 @@ Given a topic like *"Bhagavad Gita Chapter 2, Verse 47"* or *"The rise of Ravana
 | **FFmpeg** | Video processing | `brew install ffmpeg` |
 | **Ollama** | Local LLM (llama3.2:3b) | `brew install ollama` |
 | **Draw Things** | AI image generation (FLUX.1 [schnell]) | Download from App Store, enable HTTP API on port 7888 |
+| **ElevenLabs** | Premium Voiceover (Optional) | `pip install elevenlabs` + API Key |
 
 ---
 
@@ -274,7 +275,7 @@ When you run `python main.py "Your Topic"`, here's what happens:
 | Feature | Implementation |
 |---------|----------------|
 | **Script Generation** | Ollama with custom historian/philosopher system prompt |
-| **Voiceover** | Microsoft Edge TTS (en-IN-NeerjaNeural - Indian English) |
+| **Voiceover** | ElevenLabs (Premium) or Edge TTS (Free fallback) |
 | **Timestamps** | mlx-whisper (Apple Neural Engine optimized) |
 | **Image Generation** | Draw Things API (port 7888) with FLUX.1 [schnell] |
 | **Video Effects** | Ken Burns (slow zoom/pan), crossfades |
@@ -301,6 +302,13 @@ When you run `python main.py "Your Topic"`, here's what happens:
 Edit `brain.py` and change:
 ```python
 OLLAMA_MODEL = "llama3.2:3b"  # Or use "llama3.1:8b" for better quality
+```
+
+### Switch Voice Provider (Edge vs ElevenLabs)
+
+Edit `voice.py`:
+```python
+TTS_PROVIDER = "elevenlabs"  # Set to "edge" for free mode
 ```
 
 ### Change the Voice

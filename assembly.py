@@ -12,12 +12,6 @@ Features:
   - Word-level dynamic captions burned into video center
   - White text with thick black stroke (anti-slop style)
   - Final render: output/final_video.mp4 (H.264, AAC audio)
-
-CHANGES FROM v1:
-  - scene_timing[] from script.json is now respected per-image
-  - Ken Burns zoom increased from 1.12 → 1.20 (more visible motion)
-  - Pan range increased for more dynamic feel
-  - Crossfade duration increased from 0.6s → 1.2s (smoother transitions)
 """
 
 import json
@@ -55,14 +49,14 @@ VIDEO_HEIGHT = 1920
 VIDEO_FPS = 30
 
 # Ken Burns settings — increased for visible motion
-ZOOM_FACTOR = 1.20        # ✅ FIX: Was 1.12 (12%). Now 1.20 (20% zoom) — much more visible
-PAN_RANGE_X = 60          # ✅ FIX: Was 40px. Now 60px
-PAN_RANGE_Y = 40          # ✅ FIX: Was 25px. Now 40px
+ZOOM_FACTOR = 1.20        # 20% zoom-in (Dramatic)
+PAN_RANGE_X = 60          # 60px horizontal pan
+PAN_RANGE_Y = 40          # 40px vertical pan
 
 # Image display timing — used only as fallback if no scene_timing provided
-MIN_IMAGE_DURATION = 4.0   # seconds
-MAX_IMAGE_DURATION = 14.0  # seconds
-CROSSFADE_DURATION = 1.2   # ✅ FIX: Was 0.6s. Now 1.2s — smoother crossfades
+MIN_IMAGE_DURATION = 2.0   # Lowered to allow fast hooks
+MAX_IMAGE_DURATION = 14.0
+CROSSFADE_DURATION = 1.2   # Smoother transitions
 
 # Caption styling
 CAPTION_FONT_SIZE = 72
@@ -198,32 +192,23 @@ def _resolve_image_durations(
     scene_timing: list = None,
 ) -> list:
     """
-    ✅ FIX: Compute per-image durations from scene_timing[] if available.
-    Falls back to equal distribution if scene_timing is missing or wrong length.
-
-    Args:
-        num_images: Number of images to display
-        audio_duration: Total audio duration in seconds
-        scene_timing: List of relative weights from script.json (e.g. [3,7,8,10,10,8,7,7])
-
-    Returns:
-        List of floats, one duration per image, summing to ~audio_duration
+    Compute per-image durations. Uses scene_timing if available,
+    otherwise falls back to equal distribution.
     """
-    if scene_timing and len(scene_timing) == num_images and all(t > 0 for t in scene_timing):
+    # 1. Use scene_timing if valid
+    if scene_timing and len(scene_timing) == num_images and all(isinstance(t, (int, float)) and t > 0 for t in scene_timing):
         total_weight = sum(scene_timing)
+        # Scale relative weights to fit exact audio duration
         durations = [
-            max(MIN_IMAGE_DURATION, (t / total_weight) * audio_duration)
+            (t / total_weight) * audio_duration
             for t in scene_timing
         ]
-        # Scale to exactly fit audio_duration
-        scale = audio_duration / sum(durations)
-        durations = [d * scale for d in durations]
         return durations
-    else:
-        # Fallback: equal distribution
-        base = audio_duration / num_images
-        clamped = max(MIN_IMAGE_DURATION, min(MAX_IMAGE_DURATION, base))
-        return [clamped] * num_images
+    
+    # 2. Fallback: Equal distribution
+    base = audio_duration / num_images
+    clamped = max(MIN_IMAGE_DURATION, min(MAX_IMAGE_DURATION, base))
+    return [clamped] * num_images
 
 
 # ── Caption Frame Renderer ────────────────────────────────────────────────────
@@ -279,17 +264,6 @@ def _render_caption_frame(
     center_x = frame_size[0] // 2
     center_y = int(frame_size[1] * CAPTION_Y_POSITION)
     start_y = center_y - total_h // 2
-
-    bg_x1 = center_x - max_w // 2 - CAPTION_BG_PADDING
-    bg_y1 = start_y - CAPTION_BG_PADDING
-    bg_x2 = center_x + max_w // 2 + CAPTION_BG_PADDING
-    bg_y2 = start_y + total_h + CAPTION_BG_PADDING
-
-    draw.rounded_rectangle(
-        [bg_x1, bg_y1, bg_x2, bg_y2],
-        radius=15,
-        fill=(0, 0, 0, CAPTION_BG_ALPHA)
-    )
 
     stroke_offsets = [
         (-CAPTION_STROKE_WIDTH, -CAPTION_STROKE_WIDTH),
@@ -363,7 +337,7 @@ def assemble_video(
     image_paths: list,
     audio_path: Path,
     caption_chunks: list,
-    scene_timing: list = None,       # ✅ FIX: New parameter — accepts scene_timing from script
+    scene_timing: list = None,
     output_path: Path = FINAL_VIDEO,
     verbose: bool = True,
 ) -> Optional[Path]:
@@ -374,9 +348,9 @@ def assemble_video(
         print(f"   Images: {len(image_paths)}")
         print(f"   Captions: {len(caption_chunks)} chunks")
         if scene_timing:
-            print(f"   Scene timing: {scene_timing} (from script)")
+            print(f"   ⏱️  Using scene timing: {scene_timing}")
         else:
-            print(f"   Scene timing: equal distribution (no scene_timing in script)")
+            print(f"   ⏱️  Using equal duration distribution")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -397,24 +371,24 @@ def assemble_video(
         return None
 
     num_images = len(image_paths)
-
-    # ✅ FIX: Use scene_timing to compute per-image durations
+    
+    # Calculate specific duration for each image
     image_durations = _resolve_image_durations(num_images, total_duration, scene_timing)
 
     if verbose:
         print(f"\n   🖼️  Building {num_images} Ken Burns clips...")
-        for i, d in enumerate(image_durations):
-            print(f"      Image {i+1}: {d:.1f}s")
 
     # Build Ken Burns Clips
     kb_clips = []
     current_time = 0.0
 
     for i, img_path in enumerate(image_paths):
-        clip_duration = image_durations[i] + CROSSFADE_DURATION
+        # Add crossfade buffer to duration
+        this_duration = image_durations[i]
+        clip_duration = this_duration + CROSSFADE_DURATION
 
         if verbose:
-            print(f"   [{i+1}/{num_images}] Ken Burns on {img_path.name} ({clip_duration:.1f}s, dir={i%8})...")
+            print(f"   [{i+1}/{num_images}] Ken Burns on {img_path.name} (display: {this_duration:.1f}s)...")
 
         try:
             kb_clip = _make_ken_burns_clip(
@@ -445,7 +419,7 @@ def assemble_video(
             except Exception as e2:
                 print(f"   ❌ Static fallback also failed: {e2}")
 
-        current_time += image_durations[i]
+        current_time += this_duration
 
     if not kb_clips:
         print("   ❌ No video clips could be created.")

@@ -1,16 +1,9 @@
 """
 voice.py — Module 2: Text-to-Speech + Word Timestamps
 =======================================================
-Phase A: Generates narration audio using Microsoft Edge TTS
+Phase A: Generates narration audio using Microsoft Edge TTS or ElevenLabs
 Phase B: Generates word-level timestamps by aligning the KNOWN script
          text directly against audio duration — NO Whisper transcription.
-
-WHY WE DROPPED WHISPER:
-  Whisper re-transcribes the TTS audio from scratch, which causes mishearing
-  errors like "low born" → "lo-bile", "Gandiva" → "gandhivabo", etc.
-  Since we already know exactly what words are being spoken (the narration
-  text), we simply divide the audio duration proportionally across all words.
-  This gives 100% accurate captions with zero transcription errors.
 """
 
 import asyncio
@@ -18,25 +11,83 @@ import json
 import re
 import subprocess
 import sys
+import os
 import time
 from pathlib import Path
 from typing import Optional
 
 import edge_tts
 
+# Try importing ElevenLabs (install via: pip install elevenlabs)
+try:
+    from elevenlabs.client import ElevenLabs
+    from elevenlabs import save as eleven_save
+    from elevenlabs import VoiceSettings
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    ELEVENLABS_AVAILABLE = False
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
 AUDIO_FILE = OUTPUT_DIR / "narration.mp3"
 TIMESTAMPS_FILE = OUTPUT_DIR / "timestamps.json"
-WORDS_PER_CHUNK = 4       # Words per caption chunk
+WORDS_PER_CHUNK = 1       # 1 word per chunk for dynamic "pop" effect
 
+# ── TTS Provider Settings ─────────────────────────────────────────────────────
+# Options: "edge" (Free, Microsoft) or "elevenlabs" (Paid/Freemium, High Quality)
+TTS_PROVIDER = "edge" 
+
+# ElevenLabs Settings
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "YOUR_ELEVENLABS_KEY_HERE")
+# Default: "Adam" (Standard Deep Male). Note: Free tier accounts can ONLY use standard voices, not Library voices.
+ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB" 
+
+# Edge TTS Settings
 EDGE_VOICE = "en-IN-PrabhatNeural"
 EDGE_RATE = "+5%"
 
 MACOS_VOICE = "Rishi"
 
 
-# ── TTS Audio Generation ──────────────────────────────────────────────────────
+# ── ElevenLabs Generation ─────────────────────────────────────────────────────
+
+def _generate_elevenlabs_audio(text: str, output_path: Path) -> bool:
+    """Generate audio using ElevenLabs API."""
+    if not ELEVENLABS_AVAILABLE:
+        print("      ❌ 'elevenlabs' library not installed. Run: pip install elevenlabs")
+        return False
+    
+    if not ELEVENLABS_API_KEY or "YOUR_KEY" in ELEVENLABS_API_KEY:
+        print("      ❌ ELEVENLABS_API_KEY not set. Export it or set in voice.py")
+        return False
+
+    try:
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        
+        # Generate audio
+        audio_generator = client.text_to_speech.convert(
+            text=text,
+            voice_id=ELEVENLABS_VOICE_ID,
+            model_id="eleven_multilingual_v2",
+            voice_settings=VoiceSettings(
+                stability=0.45,        # More dramatic variation
+                similarity_boost=0.80,
+                style=0.35,            # Adds storytelling expressiveness
+                use_speaker_boost=True
+            )
+        )
+        
+        # Save to file
+        with open(output_path, "wb") as f:
+            f.write(b"".join(audio_generator))
+        
+        return output_path.exists() and output_path.stat().st_size > 0
+    except Exception as e:
+        print(f"      ❌ ElevenLabs error: {e}")
+        return False
+
+
+# ── Edge TTS Generation ───────────────────────────────────────────────────────
 
 async def _generate_edge_audio(text: str, output_path: Path) -> bool:
     try:
@@ -84,12 +135,25 @@ def generate_audio(
     output_path: Path = AUDIO_FILE,
     verbose: bool = True
 ) -> Optional[Path]:
-    """Convert narration text to speech using Edge TTS (with macOS fallback)."""
+    """Convert narration text to speech using ElevenLabs or Edge TTS."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if verbose:
         print(f"\n🎙️  [voice.py] Generating TTS audio...")
-        print(f"   Voice: {EDGE_VOICE} at {EDGE_RATE} rate")
+        print(f"   Provider: {TTS_PROVIDER.upper()}")
+
+    # 1. Try ElevenLabs if selected
+    if TTS_PROVIDER == "elevenlabs":
+        if _generate_elevenlabs_audio(narration, output_path):
+            size_kb = output_path.stat().st_size / 1024
+            if verbose:
+                print(f"   ✅ Audio saved (ElevenLabs): {output_path} ({size_kb:.1f} KB)")
+            return output_path
+        print("   ⚠️  ElevenLabs failed. Falling back to Edge TTS...")
+
+    # 2. Try Edge TTS
+    if verbose:
+        print(f"   Using Edge Voice: {EDGE_VOICE} at {EDGE_RATE} rate")
 
     success = False
     try:
@@ -157,15 +221,6 @@ def _align_text_to_duration(
     """
     ✅ REPLACES WHISPER: Generate caption chunks by aligning the known
     narration text directly against the audio duration.
-
-    Strategy:
-      - Split narration into words
-      - Assign each word a proportional time slice
-      - Add a short leading silence offset (TTS typically starts ~0.3s in)
-      - Group words into chunks of `chunk_size`
-
-    This gives 100% accurate captions since we use the original script text,
-    not a re-transcription that can introduce errors.
     """
     # Tokenize: split on whitespace, preserve punctuation in display
     raw_words = narration.split()
@@ -228,9 +283,6 @@ def generate_timestamps(
 ) -> Optional[list]:
     """
     Generate word-level caption timestamps from narration text + audio duration.
-
-    NOTE: `narration` parameter is now required — we align text directly
-    instead of transcribing audio with Whisper.
     """
     if verbose:
         print(f"\n⏱️  [voice.py] Generating caption timestamps...")
@@ -268,14 +320,6 @@ def process_voice(
 ) -> tuple[Optional[Path], Optional[list]]:
     """
     Full voice pipeline: TTS → Audio → Caption Timestamps.
-
-    Args:
-        narration: The exact script text that will be spoken
-        output_dir: Where to save narration.mp3 and timestamps.json
-        verbose: Whether to print progress
-
-    Returns:
-        (audio_path, caption_chunks) or (None, None) on failure
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -72,7 +72,7 @@ You MUST respond ONLY with a single valid JSON object. No preamble, no markdown 
 
 2. "narration": The complete spoken script as a single string. Write it as a documentary narrator would speak — with gravitas, pauses implied by punctuation, and a sense of ancient wisdom being revealed.
 
-3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a cartoon-style ancient Indian illustration. Rules: \n   - DESCRIBE PIXELS, NOT CONCEPTS. Don't say "symbolizing peace", say "a man sitting under a tree".\n   - Keep it literal. \n   - Focus on characters and action.
+3. "image_prompts": An array of exactly 8 strings. Each string is a highly descriptive visual prompt for generating a cartoon-style ancient Indian illustration. Rules: \n   - **FIRST IMAGE MUST BE A HOOK:** An extreme close-up of eyes, a weapon, or intense action. No wide static shots for the first image.\n   - DESCRIBE PIXELS, NOT CONCEPTS. Don't say "symbolizing peace", say "a man sitting under a tree".\n   - Keep it literal. \n   - Focus on characters and action.
 
 4. "scene_timing": An array of exactly 8 integers. Each value represents seconds each corresponding image_prompt should remain on screen.
    - Array length must equal image_prompts length.
